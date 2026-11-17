@@ -1,0 +1,15 @@
+#!/bin/bash
+# Reproduce Frost Bridge's headline measurements. Usage: scripts/bench.sh
+set -euo pipefail
+cd "$(dirname "$0")/.."
+cargo build --release -q
+F=./target/release/frostd
+echo "### platform";                $F info
+echo; echo "### direct Metal baseline (no broker)"; $F bench-direct --iters 3000
+$F run capsules/gpu-latency.toml 2>/dev/null | grep -E "round trip|pickup|pipelined" | grep -v RESULT | sed 's/^\[[^]]*\] *//'
+echo; echo "### crypto + inference";           $F run capsules/crypto-hash.toml capsules/infer-mlp.toml 2>/dev/null | grep -E "sha256|mlp|tok/s" | grep -v RESULT | sed 's/^\[[^]]*\] *//'
+echo; echo "### RT jitter under 14 CPU hogs";  $F run capsules/rt-jitter.toml 2>/dev/null | grep lateness | grep -v RESULT | sed 's/^\[[^]]*\] *//'
+for mode in --no-slicing ""; do
+  echo; echo "### high-prio latency next to a GPU flood ${mode:-(slicing on)}"
+  $F run $mode capsules/lat-under-load.toml capsules/hash-flood.toml 2>/dev/null | grep -E "round trip .spin|sha256" | grep -v RESULT | sed 's/^\[[^]]*\] *//'
+done
