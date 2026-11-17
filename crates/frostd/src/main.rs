@@ -1,0 +1,238 @@
+//! frostd — Frost Bridge capsule supervisor and GPU broker.
+//!
+//! ```text
+//! frostd info
+//! frostd run [--rt] [--quiet] [--idle-spin-us N] [--json] <capsule.toml>...
+//! frostd bench-direct [--iters N]
+//! frostd profile <capsule.toml>         # print the generated Seatbelt profile
+//! frostd serve [--socket PATH] [run flags]   # long-lived daemon
+//! frostd ctl [--socket PATH] launch <capsule.toml> | ps | kill <name> | shutdown
+//! ```
+
+mod daemon;
+
+use anyhow::{bail, Context, Result};
+use daemon::{Config, Daemon};
+use fb_core::manifest::Manifest;
+use std::path::Path;
+
+fn main() {
+    if let Err(e) = real_main() {
+        eprintln!("frostd: error: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+fn real_main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(cmd) = args.first() else {
+        bail!("usage: frostd <info|run|bench-direct|profile> ...");
+    };
+    let rest = &args[1..];
+    match cmd.as_str() {
+        "info" => info(),
+        "run" => run(rest),
+        "bench-direct" => bench_direct(rest),
+        "serve" => serve(rest),
+        "ctl" => ctl(rest),
+        "profile" => {
+            let p = Path::new(rest.first().context("profile <capsule.toml>")?);
+            let m = Manifest::load(p)?;
+            let base = p.parent().unwrap_or(Path::new("."));
+            let exec = std::fs::canonicalize(base.join(&m.exec)).unwrap_or_else(|_| base.join(&m.exec));
+            print!("{}", fb_capsule::profile(&m, &exec, Path::new("/private/tmp/frost-root")));
+            Ok(())
+        }
+        other => bail!("unknown command {other}"),
+    }
+}
+
+fn info() -> Result<()> {
+    let g = fb_gpu::Gpu::new()?;
+    let (p, e) = fb_core::sched::core_topology();
+    println!("gpu:              {}", g.name());
+    println!("unified memory:   {}", g.unified_memory());
+    println!("working set:      {} MiB recommended", g.recommended_working_set() >> 20);
+    println!("cpu:              {p} performance + {e} efficiency cores");
+    println!("page size:        {} B", fb_core::page_size());
+    println!("kernels:          {:?}", g.kernel_names());
+    Ok(())
+}
+
+fn default_socket() -> std::path::PathBuf {
+    Config::default().run_dir.join("frostd.sock")
+}
+
+/// Parse shared daemon flags; returns (config, --json, --socket, positional args).
+fn parse_flags(args: &[String]) -> Result<(Config, bool, std::path::PathBuf, Vec<String>)> {
+    let mut cfg = Config::default();
+    let mut json = false;
+    let mut socket = default_socket();
+    let mut manifests = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--socket" => socket = it.next().context("--socket PATH")?.into(),
+            "--rt" => cfg.realtime_dispatcher = true,
+            "--quiet" => cfg.quiet = true,
+            "--json" => json = true,
+            "--no-watchdog" => cfg.watchdog = false,
+            "--slice-us" => cfg.slice_us = it.next().context("--slice-us N")?.parse()?,
+            "--no-slicing" => cfg.slice_us = 0,
+            "--keepwarm-us" => cfg.keepwarm_us = it.next().context("--keepwarm-us N")?.parse()?,
+            "--idle-spin-us" => cfg.idle_spin_us = it.next().context("--idle-spin-us N")?.parse()?,
+            "--run-dir" => cfg.run_dir = it.next().context("--run-dir DIR")?.into(),
+            m => manifests.push(m.to_string()),
+        }
+    }
+    Ok((cfg, json, socket, manifests))
+}
+
+fn load_and_launch(d: &std::sync::Arc<Daemon>, m: &str) -> Result<String> {
+    let p = Path::new(m);
+    let man = Manifest::load(p)?;
+    let parent = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let base = std::fs::canonicalize(parent)?;
+    let name = man.name.clone();
+    d.launch(man, &base)?;
+    Ok(name)
+}
+
+fn serve(args: &[String]) -> Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    let (cfg, _, socket, _) = parse_flags(args)?;
+    let d = Daemon::start(cfg)?;
+    let _ = std::fs::remove_file(&socket);
+    let l = UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
+    // Owner-only: the socket can launch code with GPU access.
+    std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    eprintln!("frostd: serving on {} (gpu: {})", socket.display(), d.gpu.name());
+    for conn in l.incoming() {
+        let Ok(conn) = conn else { continue };
+        let mut w = conn.try_clone()?;
+        let mut stop = false;
+        for line in BufReader::new(conn).lines().map_while(Result::ok) {
+            let req: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({"cmd": "", "err": e.to_string()}),
+            };
+            let resp = match req["cmd"].as_str().unwrap_or("") {
+                "launch" => match load_and_launch(&d, req["manifest"].as_str().unwrap_or("")) {
+                    Ok(name) => serde_json::json!({"ok": true, "name": name}),
+                    Err(e) => serde_json::json!({"ok": false, "err": format!("{e:#}")}),
+                },
+                "ps" => serde_json::json!({"ok": true, "capsules": d.slots().iter().map(|s| s.report()).collect::<Vec<_>>()}),
+                "kill" => serde_json::json!({"ok": d.kill(req["name"].as_str().unwrap_or(""))}),
+                "shutdown" => { stop = true; serde_json::json!({"ok": true}) }
+                _ => serde_json::json!({"ok": false, "err": "unknown cmd"}),
+            };
+            writeln!(w, "{resp}")?;
+            if stop { break; }
+        }
+        if stop { break; }
+    }
+    d.shutdown();
+    let _ = std::fs::remove_file(&socket);
+    Ok(())
+}
+
+fn ctl(args: &[String]) -> Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+    let (_, _, socket, pos) = parse_flags(args)?;
+    let req = match pos.first().map(String::as_str) {
+        Some("launch") => {
+            let m = std::fs::canonicalize(pos.get(1).context("launch <capsule.toml>")?)?;
+            serde_json::json!({"cmd": "launch", "manifest": m})
+        }
+        Some("kill") => serde_json::json!({"cmd": "kill", "name": pos.get(1).context("kill <name>")?}),
+        Some(c @ ("ps" | "shutdown")) => serde_json::json!({"cmd": c}),
+        _ => bail!("ctl launch <toml> | ps | kill <name> | shutdown"),
+    };
+    let mut s = std::os::unix::net::UnixStream::connect(&socket)
+        .with_context(|| format!("connect {} (is `frostd serve` running?)", socket.display()))?;
+    writeln!(s, "{req}")?;
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line)?;
+    let v: serde_json::Value = serde_json::from_str(&line)?;
+    if req["cmd"] == "ps" {
+        println!("{:<16} {:>7} {:>9} {:>7} {:>9} {:>9} {:>10}", "capsule", "pid", "state", "jobs", "gpu ms", "peak MiB", "startup ms");
+        for c in v["capsules"].as_array().into_iter().flatten() {
+            let state = if c["alive"] == true { "up".to_string() } else { format!("exit {}", c["exit"].as_i64().map(|x| x.to_string()).unwrap_or_else(|| format!("sig{}", c["signal"]))) };
+            println!("{:<16} {:>7} {:>9} {:>7} {:>9.2} {:>9.1} {:>10.2}", c["name"].as_str().unwrap_or(""), c["pid"], state, c["jobs"],
+                c["gpu_ms"].as_f64().unwrap_or(0.0), c["peak_footprint_mb"].as_f64().unwrap_or(0.0), c["startup_ms"].as_f64().unwrap_or(f64::NAN));
+        }
+    } else {
+        println!("{v}");
+    }
+    anyhow::ensure!(v["ok"] == true, "request failed");
+    Ok(())
+}
+
+fn run(args: &[String]) -> Result<()> {
+    let (cfg, json, _, manifests) = parse_flags(args)?;
+    if manifests.is_empty() {
+        bail!("run: no capsule manifests given");
+    }
+    let d = Daemon::start(cfg)?;
+    let mut failed = false;
+    for m in &manifests {
+        if let Err(e) = load_and_launch(&d, m) {
+            eprintln!("frostd: launch {m}: {e:#}");
+            failed = true;
+        }
+    }
+    d.wait_all();
+    let reports: Vec<_> = d.slots().iter().map(|s| s.report()).collect();
+    d.shutdown();
+    if json {
+        println!("REPORT {}", serde_json::to_string(&reports)?);
+    } else {
+        println!("\n{:<16} {:>7} {:>6} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8}  notes", "capsule", "exit", "jobs", "gpu ms", "cpu ms", "wall ms", "peak MiB", "thr ms", "start ms");
+        for r in &reports {
+            let exit = match (r.exit, r.signal) {
+                (Some(c), _) => c.to_string(),
+                (_, Some(s)) => format!("sig{s}"),
+                _ => "?".into(),
+            };
+            println!(
+                "{:<16} {:>7} {:>6} {:>9.2} {:>9.1} {:>9.1} {:>9.1} {:>8.1} {:>8.2}  {}",
+                r.name, exit, r.jobs, r.gpu_ms, r.cpu_ms, r.wall_ms, r.peak_footprint_mb, r.throttled_ms,
+                r.startup_ms.unwrap_or(f64::NAN),
+                r.killed_for.clone().unwrap_or_default()
+            );
+        }
+    }
+    if failed {
+        bail!("one or more capsules failed to launch");
+    }
+    Ok(())
+}
+
+/// Baseline: dispatch latency when the workload owns Metal directly (no broker).
+fn bench_direct(args: &[String]) -> Result<()> {
+    let iters: usize = args.iter().position(|a| a == "--iters").and_then(|i| args.get(i + 1)).map(|v| v.parse()).transpose()?.unwrap_or(2000);
+    let _ = fb_core::sched::set_thread_qos(fb_core::sched::Qos::UserInteractive);
+    let g = fb_gpu::Gpu::new()?;
+    let buf = g.alloc(1 << 16)?;
+    let q = g.new_queue()?;
+    let mut job = fb_core::abi::Job { kernel: fb_core::abi::kernel::NOOP, n_args: 1, grid: [1, 1, 1], ..Default::default() };
+    job.args[0] = fb_core::abi::BufRef { off: 0, len: 16 };
+    let win = fb_gpu::Window { off: 0, len: buf.len as u64 };
+    for mode in ["spin", "wait"] {
+        let mut samples = Vec::with_capacity(iters);
+        for i in 0..iters + 100 {
+            let t0 = fb_core::time::now_ns();
+            let mut b = g.batch_on(&q)?;
+            b.encode(&buf, win, &job).map_err(|s| anyhow::anyhow!("{s:?}"))?;
+            let f = b.commit();
+            let d = if mode == "spin" { f.spin() } else { f.wait() };
+            anyhow::ensure!(d.ok);
+            if i >= 100 {
+                samples.push(fb_core::time::now_ns() - t0);
+            }
+        }
+        println!("direct-metal noop round trip ({mode:>4}): {}", fb_core::time::Summary::of(&mut samples));
+    }
+    Ok(())
+}
