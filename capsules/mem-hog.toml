@@ -1,0 +1,7 @@
+name = "mem-hog"
+exec = "../target/release/mem-hog"
+args = ["--mb", "1024"]
+[memory]
+limit_mb = 128
+[gpu]
+arena_mb = 1

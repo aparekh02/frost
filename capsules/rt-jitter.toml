@@ -1,0 +1,7 @@
+name = "rt-jitter"
+exec = "../target/release/rt-jitter"
+args = ["--period-us", "500", "--iters", "4000", "--stress", "14"]
+[cpu]
+class = "performance"
+[gpu]
+arena_mb = 1

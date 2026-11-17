@@ -1,0 +1,5 @@
+name = "evil"
+exec = "../target/release/evil"
+[gpu]
+arena_mb = 1
+custom_kernels = false

@@ -1,0 +1,6 @@
+name = "probe-perf"
+exec = "../target/release/probe"
+[cpu]
+class = "performance"
+[gpu]
+arena_mb = 1

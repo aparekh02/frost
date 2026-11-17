@@ -1,0 +1,9 @@
+name = "lat-under-load"
+exec = "../target/release/gpu-latency"
+args = ["--iters", "3000", "--delay-ms", "1800"]
+[cpu]
+class = "performance"
+realtime = { period_us = 1000, computation_us = 400, constraint_us = 900 }
+[gpu]
+arena_mb = 1
+priority = 100

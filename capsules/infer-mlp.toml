@@ -1,0 +1,11 @@
+name = "infer-mlp"
+exec = "../target/release/infer-mlp"
+args = ["--dim", "1024", "--layers", "8", "--tokens", "300"]
+[cpu]
+class = "performance"
+[memory]
+limit_mb = 256
+[gpu]
+arena_mb = 48
+priority = 50
+custom_kernels = true

@@ -1,0 +1,11 @@
+# Noisy neighbour: saturates the GPU with big hash batches at low priority.
+name = "hash-flood"
+exec = "../target/release/crypto-hash"
+args = ["--n", "1048576", "--len", "200", "--rounds", "500"]
+[cpu]
+class = "efficiency"
+[memory]
+limit_mb = 512
+[gpu]
+arena_mb = 300
+priority = 0

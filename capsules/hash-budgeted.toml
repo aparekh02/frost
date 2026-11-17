@@ -1,0 +1,12 @@
+# Same flood but capped at 100 ms of GPU time per second.
+name = "hash-budgeted"
+exec = "../target/release/crypto-hash"
+args = ["--n", "1048576", "--len", "200", "--rounds", "20"]
+[cpu]
+class = "efficiency"
+[memory]
+limit_mb = 512
+[gpu]
+arena_mb = 300
+priority = 0
+gpu_ms_per_sec = 100
