@@ -1,0 +1,9 @@
+[package]
+name = "fb-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fb-core.workspace = true
+anyhow.workspace = true
+libc.workspace = true
