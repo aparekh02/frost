@@ -18,6 +18,8 @@
 //! arena_mb = 64                  # zero-copy unified-memory arena shared with the GPU
 //! priority = 10                  # higher is served first by the GPU scheduler
 //! gpu_ms_per_sec = 800           # GPU time budget (token bucket)
+//! max_percent = 25               # OR: cap GPU time at 25% (overrides gpu_ms_per_sec)
+//! max_inflight = 4               # cap command buffers in flight (instantaneous occupancy)
 //! custom_kernels = false         # allow runtime MSL registration (trust boundary!)
 //!
 //! [sandbox]
@@ -100,14 +102,40 @@ pub struct Gpu {
     pub arena_mb: u64,
     #[serde(default)]
     pub priority: i32,
+    /// GPU time budget as a token bucket (ms of GPU time per wall-clock second).
     #[serde(default = "d_gpu_budget")]
     pub gpu_ms_per_sec: u64,
+    /// Friendlier cap: at most this percent of the GPU's time. When set it overrides
+    /// `gpu_ms_per_sec` (25 => the capsule may never exceed 25% GPU utilization).
+    #[serde(default)]
+    pub max_percent: Option<u32>,
+    /// Cap on command buffers this capsule may have in flight at once — bounds how much of
+    /// the GPU it can occupy *instantaneously*, even inside its time budget.
+    #[serde(default = "d_inflight")]
+    pub max_inflight: u32,
     #[serde(default)]
     pub custom_kernels: bool,
 }
 impl Default for Gpu {
     fn default() -> Self {
-        Gpu { arena_mb: d_arena(), priority: 0, gpu_ms_per_sec: d_gpu_budget(), custom_kernels: false }
+        Gpu {
+            arena_mb: d_arena(),
+            priority: 0,
+            gpu_ms_per_sec: d_gpu_budget(),
+            max_percent: None,
+            max_inflight: d_inflight(),
+            custom_kernels: false,
+        }
+    }
+}
+impl Gpu {
+    /// Effective GPU-time budget (ms/s): `max_percent` wins over `gpu_ms_per_sec` when set.
+    /// 1% of a second == 10 ms of GPU time per second.
+    pub fn budget_ms_per_sec(&self) -> u64 {
+        match self.max_percent {
+            Some(p) => (p.min(100) as u64) * 10,
+            None => self.gpu_ms_per_sec,
+        }
     }
 }
 
@@ -141,6 +169,9 @@ fn d_arena() -> u64 {
 fn d_gpu_budget() -> u64 {
     1000
 }
+fn d_inflight() -> u32 {
+    8
+}
 
 impl Manifest {
     pub fn load(path: &Path) -> Result<Manifest> {
@@ -154,6 +185,8 @@ impl Manifest {
             "capsule name must be [A-Za-z0-9_-]+"
         );
         anyhow::ensure!(m.gpu.arena_mb >= 1 && m.gpu.arena_mb <= 8192, "gpu.arena_mb out of range");
+        anyhow::ensure!(m.gpu.max_percent.is_none_or(|p| p >= 1 && p <= 100), "gpu.max_percent must be 1..=100");
+        anyhow::ensure!(m.gpu.max_inflight >= 1 && m.gpu.max_inflight <= 64, "gpu.max_inflight must be 1..=64");
         Ok(m)
     }
 }
@@ -178,7 +211,15 @@ mod tests {
         .unwrap();
         assert_eq!(m.cpu.class, CoreClass::Efficiency);
         assert_eq!(m.gpu.priority, 3);
+        assert_eq!(m.gpu.max_inflight, 8); // default
+        assert_eq!(m.gpu.budget_ms_per_sec(), 1000); // default = 100%
         assert!(m.sandbox.enabled && !m.sandbox.network);
+        // max_percent overrides gpu_ms_per_sec and is validated.
+        let capped = Manifest::parse("name='c'\nexec='x'\n[gpu]\nmax_percent=25\nmax_inflight=2").unwrap();
+        assert_eq!(capped.gpu.budget_ms_per_sec(), 250);
+        assert_eq!(capped.gpu.max_inflight, 2);
+        assert!(Manifest::parse("name='c'\nexec='x'\n[gpu]\nmax_percent=0").is_err());
+        assert!(Manifest::parse("name='c'\nexec='x'\n[gpu]\nmax_inflight=0").is_err());
         assert!(Manifest::parse("name='bad name'\nexec='x'").is_err());
         assert!(Manifest::parse("name='a'\nexec='x'\nbogus=1").is_err());
     }

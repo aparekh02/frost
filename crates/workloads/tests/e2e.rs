@@ -159,6 +159,29 @@ fn gpu_budget_is_enforced() {
 }
 
 #[test]
+fn gpu_percent_cap_contains_a_capsule() {
+    // "I don't want it using all of the GPU": a capsule declaring max_percent = 25 that
+    // tries to flood the device must be held to ~a quarter of it.
+    let r = run(&[], &[("crypto-hash", "name = \"quarter\"\nargs = [\"--n\", \"1048576\", \"--len\", \"200\", \"--rounds\", \"30\"]\n[cpu]\nclass = \"performance\"\n[memory]\nlimit_mb = 512\n[gpu]\narena_mb = 300\nmax_percent = 25")]);
+    let busy = r.result("crypto_hash")["gpu_busy"].as_f64().unwrap();
+    println!("capsule capped at 25%: measured GPU busy {:.1}%", busy * 100.0);
+    assert!(busy < 0.35, "max_percent=25 not enforced: {busy:.3} busy");
+    let rep = r.report("quarter");
+    assert_eq!(rep["gpu_cap_pct"], 25.0);
+    assert_eq!(rep["gpu_mem_mb"], 300.0);
+    assert!(rep["throttled_ms"].as_f64().unwrap() > 50.0, "a flooding capped capsule should be throttled");
+}
+
+#[test]
+fn max_inflight_one_still_correct() {
+    // Occupancy cap: a capsule limited to a single command buffer in flight must still
+    // produce correct results (just with less pipelining).
+    let r = run(&[], &[("crypto-hash", "name = \"serial\"\nargs = [\"--n\", \"65536\", \"--len\", \"77\", \"--rounds\", \"2\"]\n[gpu]\narena_mb = 16\nmax_inflight = 1")]);
+    assert_eq!(r.result("crypto_hash")["mismatches"], 0);
+    assert_eq!(r.report("serial")["exit"], 0);
+}
+
+#[test]
 fn priority_slicing_protects_latency() {
     let lat = "name = \"lat\"\nargs = [\"--iters\", \"1500\", \"--delay-ms\", \"1800\", \"--pipeline\", \"2000\"]\n[cpu]\nclass = \"performance\"\n[gpu]\narena_mb = 1\npriority = 100";
     let flood = "name = \"flood\"\nargs = [\"--n\", \"1048576\", \"--len\", \"200\", \"--rounds\", \"400\"]\n[cpu]\nclass = \"efficiency\"\n[memory]\nlimit_mb = 512\n[gpu]\narena_mb = 300";

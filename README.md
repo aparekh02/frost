@@ -52,9 +52,22 @@ realtime = { period_us = 1000, computation_us = 300, constraint_us = 900 }
 [memory]
 limit_mb = 512
 [gpu]
-arena_mb = 64                    # zero-copy GPU-visible memory
+arena_mb = 64                    # zero-copy GPU-visible memory (also the hard GPU memory cap)
 priority = 50
-gpu_ms_per_sec = 500
+max_percent = 25                 # never use more than 25% of the GPU's time
+max_inflight = 4                 # at most 4 command buffers on the GPU at once
+```
+
+**Containing the GPU.** A capsule reaches the GPU only through the broker, and its share is
+capped three ways: `max_percent` (GPU-time utilization — a capsule flooding flat-out against
+`max_percent = 20` is held to ≈19.5%), `max_inflight` (how much of the device it can occupy at
+once), and `arena_mb` (its GPU memory). `frostd ctl ps` shows each container's live GPU share
+vs. its cap:
+
+```
+capsule              pid     state    jobs    gpu ms  gpu now/cap   gpu MiB  peak MiB
+capped15           40483        up       1     80.94       8%/15%       300       4.1
+game               40485        up    1501    162.15       6%/40%        16       4.1
 ```
 
 ```rust
@@ -85,7 +98,7 @@ Latest run (Apple M4, macOS 27.0.1, Rust 1.98.1): **24 passed, 0 failed, 1 ignor
 | `fb-core` unit | 6/6 ✅ | SPSC ring ordering over 2M items, full/empty, **corrupted peer indices contained**, ABI layout stable, manifest validation, cross-thread `os_sync` wake |
 | `fb-capsule` unit | 2/2 ✅ | Seatbelt profile is deny-by-default; a sandboxed shell can't read `/etc/hosts` or write outside its root |
 | `fb-gpu` integration | 7/7 ✅ | zero-copy dispatch on a file-backed `mmap`; SHA-256 (lengths 0–200 B) and GEMV match the CPU; out-of-window/overflow/bad-kernel rejected; custom MSL kernels; **split jobs byte-identical to unsplit**; dropped uncommitted batches don't abort |
-| `workloads` end-to-end | 10/10 ✅ | real `frostd` + real sandboxed capsules (details below) |
+| `workloads` end-to-end | 12/12 ✅ | real `frostd` + real sandboxed capsules (details below) |
 | `fb-client` doctest | 1/1 ✅ | API example compiles |
 
 End-to-end results from that run:
@@ -98,6 +111,8 @@ End-to-end results from that run:
 | `memory_limit_kills_capsule` | killed by watchdog just above its limit |
 | `gpu_workloads_are_correct` | 0 SHA-256 mismatches; MLP rel. error < 1e-3 |
 | `gpu_budget_is_enforced` | 100 ms/s budget → < 16% GPU busy (≈ 9.8% typical) |
+| `gpu_percent_cap_contains_a_capsule` | a capsule declaring `max_percent = 25` that floods the GPU is held under ~a quarter of it |
+| `max_inflight_one_still_correct` | occupancy cap of 1 command buffer still produces correct results |
 | `priority_slicing_protects_latency` | high-prio p90 under a GPU flood: **6,823 µs → 152 µs** |
 | `gravity_renders_frames` | sandboxed game renders on the GPU (both render + compute paths); deterministic (checksum reproducible), **> 120 fps** |
 | `gravity_hardware_render_beats_compute` | the hardware rasterizer spends less GPU time per frame than the compute software rasterizer |

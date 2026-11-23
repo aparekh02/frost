@@ -81,6 +81,12 @@ pub struct Report {
     pub jobs: u64,
     pub rejected: u64,
     pub gpu_ms: f64,
+    /// Live GPU utilization over the last window (percent of the whole device).
+    pub gpu_pct: f64,
+    /// The capsule's GPU time cap, as a percent of the device (100 = uncapped).
+    pub gpu_cap_pct: f64,
+    /// GPU memory this capsule may use (its arena) in MiB — a hard per-capsule cap.
+    pub gpu_mem_mb: f64,
     pub throttled_ms: f64,
     pub peak_footprint_mb: f64,
     pub cpu_ms: f64,
@@ -103,6 +109,8 @@ pub struct Slot {
     pub peak_footprint: AtomicU64,
     pub cpu_ns: AtomicU64,
     pub hello_ns: AtomicU64,
+    /// Live GPU utilization in per-mille of the device (0..1000), last window.
+    pub util_pm: AtomicU64,
     pub killed_for: Mutex<Option<String>>,
     pub exit: Mutex<Option<std::process::ExitStatus>>,
     pub started: std::time::Instant,
@@ -128,6 +136,9 @@ impl Slot {
             jobs: self.jobs.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
             gpu_ms: self.gpu_ns.load(Ordering::Relaxed) as f64 / 1e6,
+            gpu_pct: self.util_pm.load(Ordering::Relaxed) as f64 / 10.0,
+            gpu_cap_pct: self.manifest.gpu.budget_ms_per_sec() as f64 / 10.0,
+            gpu_mem_mb: self.manifest.gpu.arena_mb as f64,
             throttled_ms: self.throttled.load(Ordering::Relaxed) as f64 / 1e6,
             peak_footprint_mb: self.peak_footprint.load(Ordering::Relaxed) as f64 / 1048576.0,
             cpu_ms: self.cpu_ns.load(Ordering::Relaxed) as f64 / 1e6,
@@ -165,6 +176,11 @@ struct Lane {
     last_submit_ns: u64,
     last_refill: u64,
     priority: i32,
+    /// Max command buffers this capsule may have on the GPU at once (occupancy cap).
+    max_inflight: usize,
+    /// Rolling GPU-utilization window: busy ns accumulated since `util_win_start`.
+    util_win_start: u64,
+    util_busy_ns: u64,
     /// Cached render target for the graphics plane (reused across frames of one size).
     rt: Option<RenderTarget>,
     slot: Arc<Slot>,
@@ -304,6 +320,7 @@ impl Daemon {
             peak_footprint: AtomicU64::new(0),
             cpu_ns: AtomicU64::new(0),
             hello_ns: AtomicU64::new(0),
+            util_pm: AtomicU64::new(0),
             killed_for: Mutex::new(None),
             exit: Mutex::new(None),
             started: std::time::Instant::now(),
@@ -331,7 +348,7 @@ impl Daemon {
         drop(theirs);
         let pid = child.id() as i32;
         slot.pid.store(pid, Ordering::Release);
-        self.log(&m.name, &format!("started pid={pid} qos={:?} arena={}MiB prio={}", fb_capsule::qos_for(m.cpu.class), layout.arena_len >> 20, m.gpu.priority));
+        self.log(&m.name, &format!("started pid={pid} qos={:?} arena={}MiB prio={} gpu_cap={}% max_inflight={}", fb_capsule::qos_for(m.cpu.class), layout.arena_len >> 20, m.gpu.priority, m.gpu.budget_ms_per_sec() / 10, m.gpu.max_inflight));
 
         // ---- threads: log pumps, reaper, control
         let mut th = Vec::new();
@@ -406,14 +423,18 @@ impl Daemon {
             inflight: VecDeque::new(),
             backlog: VecDeque::new(),
             // 100 ms burst window: a capsule can never run more than budget/10 ahead.
-            tokens_ns: (m.gpu.gpu_ms_per_sec * 100_000) as i64,
-            budget_ns_per_s: (m.gpu.gpu_ms_per_sec * 1_000_000) as i64,
-            burst_ns: (m.gpu.gpu_ms_per_sec * 100_000) as i64,
+            // `max_percent` (if set) wins over `gpu_ms_per_sec`.
+            tokens_ns: (m.gpu.budget_ms_per_sec() * 100_000) as i64,
+            budget_ns_per_s: (m.gpu.budget_ms_per_sec() * 1_000_000) as i64,
+            burst_ns: (m.gpu.budget_ms_per_sec() * 100_000) as i64,
             throttled_since: None,
             deferred: VecDeque::new(),
             ns_per_item: std::collections::HashMap::new(),
             last_submit_ns: 0,
             last_refill: fb_core::time::now_ns(),
+            max_inflight: m.gpu.max_inflight as usize,
+            util_win_start: fb_core::time::now_ns(),
+            util_busy_ns: 0,
             priority: m.gpu.priority,
             rt: None,
         };
@@ -606,11 +627,20 @@ fn dispatcher(gpu: Arc<Gpu>, cfg: Config, bell: Arc<Arena>, rx: mpsc::Receiver<L
 
         // 1) retire completed command buffers
         for l in lanes.iter_mut() {
+            // Publish a live GPU-utilization figure per capsule (~250 ms window) so a
+            // container's actual share of the device is observable in `ctl ps`.
+            let win = now.saturating_sub(l.util_win_start);
+            if win >= 250_000_000 {
+                l.slot.util_pm.store((l.util_busy_ns as u128 * 1000 / win as u128) as u64, Ordering::Relaxed);
+                l.util_busy_ns = 0;
+                l.util_win_start = now;
+            }
             while l.inflight.front().is_some_and(|p| p.cb.is_done()) {
                 let p = l.inflight.pop_front().unwrap();
                 let done = p.cb.wait(); // already complete: returns immediately
                 let t_done = fb_core::time::now_ns();
                 l.tokens_ns -= done.gpu_ns as i64;
+                l.util_busy_ns += done.gpu_ns;
                 l.slot.gpu_ns.fetch_add(done.gpu_ns, Ordering::Relaxed);
                 let status = if done.ok { Status::Ok } else { Status::GpuError } as u32;
                 if let [(_, k, _, items)] = p.jobs[..] {
@@ -687,7 +717,7 @@ fn dispatcher(gpu: Arc<Gpu>, cfg: Config, bell: Arc<Arena>, rx: mpsc::Receiver<L
             }
             // A higher-priority capsule is active: this lane yields. One slice in flight.
             let yielding = cfg.slice_us > 0 && hot_prio > l.priority;
-            let depth = if yielding { 1 } else { 8 };
+            let depth = if yielding { 1 } else { l.max_inflight };
             if l.inflight.len() >= depth {
                 continue;
             }

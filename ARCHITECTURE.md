@@ -18,7 +18,7 @@ provide natively, and puts one trusted process, `frostd`, in charge of the GPU.
 | CPU placement      | VM vCPUs                      | QoS class → P-cores vs E-cores (verified: E-only = CPUs 0–5)|
 | CPU real-time      | n/a                           | Mach `THREAD_TIME_CONSTRAINT_POLICY` (p99 wake 4.8 µs)      |
 | Memory limit       | cgroup in VM                  | phys_footprint watchdog (2 ms) + jetsam attr (root only)    |
-| GPU time/memory    | n/a                           | per-capsule token bucket + arena quota vs. working set      |
+| GPU time/memory    | n/a                           | per-capsule share: `max_percent` time cap, `max_inflight` occupancy cap, arena = hard memory cap |
 | Startup            | container + VM                | ~14 ms sandboxed, ~2.4 ms unsandboxed                       |
 
 ## Components
@@ -109,9 +109,16 @@ measured confined to the 6 E-cores. `performance` → USER_INTERACTIVE. Hot thre
 **GPU.** Each capsule has its own `MTLCommandQueue`. The dispatcher admits work in priority
 order, subject to:
 
-* **Token bucket**: `gpu_ms_per_sec` with a 100 ms burst window, debited by measured
-  `GPUEndTime − GPUStartTime`
-* **In-flight cap**: 8 command buffers normally, or 1 while yielding
+* **Token bucket (time share)**: `gpu_ms_per_sec` with a 100 ms burst window, debited by
+  measured `GPUEndTime − GPUStartTime`. `gpu.max_percent` is the friendly form — `max_percent
+  = 25` caps the capsule at a quarter of the device (verified: a capsule that floods flat-out
+  is held to ≈19.5% against a 20% cap). Live utilization per capsule shows in `frostd ctl ps`.
+* **In-flight cap (occupancy share)**: at most `gpu.max_inflight` command buffers on the GPU
+  at once (default 8, or 1 while yielding) — bounds how much of the device a capsule can seize
+  *instantaneously*, even within its time budget.
+* **Memory share**: a capsule's GPU-visible memory is exactly its arena (`gpu.arena_mb`), a
+  hard per-capsule cap; the sum across capsules is held under `working_set_fraction` of the
+  device's recommended working set at launch.
 * **Preemption by slicing**: Metal can't preempt a running kernel, so while a higher-priority
   capsule is active (submitted within 20 ms), splittable jobs from lower-priority capsules
   (`vadd`, `saxpy`, `sha256_batch`, `gemv`) are cut into chunks sized from an EWMA of
@@ -192,6 +199,7 @@ checksum, for both paths).
 | `gravity` hardware render vs compute raster, 1280×720, 4,000 sprites | **536 fps** (GPU 1.2 ms) vs **18 fps** (GPU 52.6 ms) — hardware raster ~30× |
 | `gravity` next to a 97%-busy GPU flood | no slicing **562 fps** (p99 12.5 ms) → with slicing **1,476 fps** (p99 3.4 ms) |
 | GPU budget 100 ms/s | 9.8% GPU busy observed |
+| GPU `max_percent = 20`, capsule flooding flat-out | held to **19.5%** of the device (throttled 5.5 s) |
 | Memory limit 128 MiB | killed at 128.8 MiB peak |
 | Startup | ~14 ms sandboxed (warm), 2.4 ms unsandboxed |
 
@@ -212,8 +220,11 @@ checksum, for both paths).
 
 * `sandbox-exec` is deprecated (but still shipped and used by Apple tooling). The
   replacement path is an App Sandbox / XPC-service design with a signed helper.
-* Hard per-capsule GPU memory isolation needs either trusted kernels only (current) or
-  one broker process per trust domain (separate GPU VA spaces).
+* GPU *time*, *occupancy* and *memory* are capped per capsule (`max_percent`, `max_inflight`,
+  `arena_mb`). What is still not hardware-*isolated* is one capsule reading another's GPU
+  memory via a hostile **custom kernel**: all arenas share the broker's GPU address space, so
+  `custom_kernels` remains a trust boundary. True isolation needs one broker process per trust
+  domain (separate GPU VA spaces); the resource caps above do not depend on it.
 * Splitting covers built-ins. Custom kernels could declare a split spec (per-arg item
   stride + count param) at registration.
 * No sharing of compiled SBPL profiles yet. Caching would cut most of the 14 ms startup.

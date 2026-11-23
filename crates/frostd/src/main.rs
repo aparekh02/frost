@@ -156,11 +156,12 @@ fn ctl(args: &[String]) -> Result<()> {
     BufReader::new(s).read_line(&mut line)?;
     let v: serde_json::Value = serde_json::from_str(&line)?;
     if req["cmd"] == "ps" {
-        println!("{:<16} {:>7} {:>9} {:>7} {:>9} {:>9} {:>10}", "capsule", "pid", "state", "jobs", "gpu ms", "peak MiB", "startup ms");
+        println!("{:<16} {:>7} {:>9} {:>7} {:>9} {:>12} {:>9} {:>9}", "capsule", "pid", "state", "jobs", "gpu ms", "gpu now/cap", "gpu MiB", "peak MiB");
         for c in v["capsules"].as_array().into_iter().flatten() {
             let state = if c["alive"] == true { "up".to_string() } else { format!("exit {}", c["exit"].as_i64().map(|x| x.to_string()).unwrap_or_else(|| format!("sig{}", c["signal"]))) };
-            println!("{:<16} {:>7} {:>9} {:>7} {:>9.2} {:>9.1} {:>10.2}", c["name"].as_str().unwrap_or(""), c["pid"], state, c["jobs"],
-                c["gpu_ms"].as_f64().unwrap_or(0.0), c["peak_footprint_mb"].as_f64().unwrap_or(0.0), c["startup_ms"].as_f64().unwrap_or(f64::NAN));
+            let share = format!("{:.0}%/{:.0}%", c["gpu_pct"].as_f64().unwrap_or(0.0), c["gpu_cap_pct"].as_f64().unwrap_or(100.0));
+            println!("{:<16} {:>7} {:>9} {:>7} {:>9.2} {:>12} {:>9.0} {:>9.1}", c["name"].as_str().unwrap_or(""), c["pid"], state, c["jobs"],
+                c["gpu_ms"].as_f64().unwrap_or(0.0), share, c["gpu_mem_mb"].as_f64().unwrap_or(0.0), c["peak_footprint_mb"].as_f64().unwrap_or(0.0));
         }
     } else {
         println!("{v}");
