@@ -182,6 +182,36 @@ fn max_inflight_one_still_correct() {
 }
 
 #[test]
+fn trust_domains_isolate_brokers() {
+    // Capsules in different trust domains run in different broker *processes* — separate GPU
+    // virtual address spaces, so a hostile custom kernel in one can't reach the other's GPU
+    // memory. Same domain shares one broker (shared address space, fine-grained scheduling).
+    let cap = |name: &str, dom: &str| format!(
+        "name = \"{name}\"\nargs = [\"--n\", \"8192\", \"--len\", \"32\", \"--rounds\", \"1\"]\n[gpu]\narena_mb = 4\ntrust_domain = \"{dom}\""
+    );
+    let r = run(&[], &[("crypto-hash", &cap("dom-a", "alpha")), ("crypto-hash", &cap("dom-b", "beta"))]);
+    assert_eq!(r.report("dom-a")["exit"], 0);
+    assert_eq!(r.report("dom-b")["exit"], 0);
+    let (pa, pb) = (r.report("dom-a")["broker_pid"].as_i64().unwrap(), r.report("dom-b")["broker_pid"].as_i64().unwrap());
+    println!("broker pids: alpha={pa}, beta={pb}");
+    assert_ne!(pa, pb, "different trust domains must be different broker processes");
+
+    let r2 = run(&[], &[("crypto-hash", &cap("dom-c", "shared")), ("crypto-hash", &cap("dom-d", "shared"))]);
+    assert_eq!(r2.report("dom-c")["broker_pid"], r2.report("dom-d")["broker_pid"], "same domain should share one broker");
+}
+
+#[test]
+fn isolate_flag_gives_each_capsule_its_own_broker() {
+    let cap = |name: &str| format!(
+        "name = \"{name}\"\nargs = [\"--n\", \"8192\", \"--len\", \"32\", \"--rounds\", \"1\"]\n[gpu]\narena_mb = 4"
+    );
+    let r = run(&["--isolate"], &[("crypto-hash", &cap("iso-a")), ("crypto-hash", &cap("iso-b"))]);
+    assert_eq!(r.report("iso-a")["exit"], 0);
+    assert_eq!(r.report("iso-b")["exit"], 0);
+    assert_ne!(r.report("iso-a")["broker_pid"], r.report("iso-b")["broker_pid"], "--isolate must give each capsule its own broker process");
+}
+
+#[test]
 fn priority_slicing_protects_latency() {
     let lat = "name = \"lat\"\nargs = [\"--iters\", \"1500\", \"--delay-ms\", \"1800\", \"--pipeline\", \"2000\"]\n[cpu]\nclass = \"performance\"\n[gpu]\narena_mb = 1\npriority = 100";
     let flood = "name = \"flood\"\nargs = [\"--n\", \"1048576\", \"--len\", \"200\", \"--rounds\", \"400\"]\n[cpu]\nclass = \"efficiency\"\n[memory]\nlimit_mb = 512\n[gpu]\narena_mb = 300";

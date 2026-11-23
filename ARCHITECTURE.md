@@ -14,6 +14,7 @@ provide natively, and puts one trusted process, `frostd`, in charge of the GPU.
 | Concern            | Docker on macOS               | Frost Bridge capsule                                       |
 |--------------------|-------------------------------|------------------------------------------------------------|
 | GPU                | none (VM)                     | Metal, brokered by `frostd`, zero-copy unified memory       |
+| GPU isolation      | n/a                           | per trust domain: a separate broker process = a separate GPU address space |
 | Filesystem/network | Linux namespaces in a VM      | Seatbelt (SBPL) deny-by-default profile                     |
 | CPU placement      | VM vCPUs                      | QoS class → P-cores vs E-cores (verified: E-only = CPUs 0–5)|
 | CPU real-time      | n/a                           | Mach `THREAD_TIME_CONSTRAINT_POLICY` (p99 wake 4.8 µs)      |
@@ -94,9 +95,10 @@ The daemon therefore:
 * ends encoders on dropped batches (an all-rejected batch used to abort the daemon; found by
   the e2e suite)
 * custom MSL kernels are **opt-in per manifest** (`gpu.custom_kernels`). They are a real trust
-  boundary: all arenas live in the daemon's GPU address space, so a hostile kernel could
-  address another capsule's arena. Only enable custom kernels for code you trust. Built-ins
-  bounds-check by their count params.
+  boundary *within a broker*: capsules sharing a trust domain share one GPU address space, so a
+  hostile kernel could address another's arena. Put untrusted custom-kernel capsules in their
+  own `gpu.trust_domain` (or run `--isolate`) and they get a separate broker process with its
+  own GPU address space — see "Trust domains" below. Built-ins bounds-check by their count params.
 
 ## Scheduling
 
@@ -127,6 +129,39 @@ order, subject to:
 * **Batching**: up to 64 ready jobs per command buffer, and `CHAIN` jobs share one buffer
   (e.g. all 16 layers of an MLP token)
 * **Keep-warm** (optional, `--keepwarm-us`): tiny periodic dispatch to hold GPU clocks
+
+## Trust domains: strong bounds between containers
+
+The resource caps above bound *how much* GPU a capsule uses. They do **not**, on their own,
+stop a capsule that runs its own GPU code (`custom_kernels`) from *reading another capsule's
+GPU memory*: inside one broker process every arena is wrapped in the same Metal device, so the
+arenas share one GPU virtual address space and a hostile kernel could forge a pointer
+(`gpuAddress`) into a neighbour's arena. A single process is the wrong isolation unit.
+
+The fix is the OS's own boundary. Each process gets its **own GPU virtual address space**, so
+`frostd` runs **one broker process per trust domain**:
+
+```
+ frostd (supervisor)
+ ├─ spawn ─▶ broker "default"  (frostd serve) ── Gpu/MTLDevice ── arenas of its capsules
+ ├─ spawn ─▶ broker "alpha"    (frostd serve) ── Gpu/MTLDevice ── isolated address space
+ └─ spawn ─▶ broker "beta"     (frostd serve) ── Gpu/MTLDevice ── isolated address space
+      routes launch/ps/kill to the right broker over a unix socket; aggregates reports
+```
+
+* A capsule's domain is `gpu.trust_domain` (default `"default"`). Capsules in the **same**
+  domain share one broker — one GPU address space, so they keep fine-grained cross-capsule
+  scheduling (priority, slicing, token buckets) and could share memory zero-copy. Capsules in
+  **different** domains are in **different processes**: a custom kernel in one physically
+  cannot address another's arena, because that memory isn't mapped in its GPU address space.
+* `frostd run --isolate` puts every capsule in its own domain — strong bounds between *each*
+  container. `frostd run a.toml b.toml` with distinct `trust_domain`s does the same per group.
+* The trade-off is explicit: isolation costs the cross-domain fine-grained scheduler (the OS
+  and GPU driver arbitrate between broker processes instead), and a second `MTLDevice`'s
+  startup. The per-capsule resource caps still apply inside each broker. Each capsule's report
+  carries the `broker_pid` that served it, so isolation is verifiable (the e2e test asserts
+  different domains get different `broker_pid`s).
+* Default `frostd run` with one domain stays a single in-process broker — no regression.
 
 ## Gravity: the GPU graphics plane
 
@@ -221,10 +256,11 @@ checksum, for both paths).
 * `sandbox-exec` is deprecated (but still shipped and used by Apple tooling). The
   replacement path is an App Sandbox / XPC-service design with a signed helper.
 * GPU *time*, *occupancy* and *memory* are capped per capsule (`max_percent`, `max_inflight`,
-  `arena_mb`). What is still not hardware-*isolated* is one capsule reading another's GPU
-  memory via a hostile **custom kernel**: all arenas share the broker's GPU address space, so
-  `custom_kernels` remains a trust boundary. True isolation needs one broker process per trust
-  domain (separate GPU VA spaces); the resource caps above do not depend on it.
+  `arena_mb`), and **cross-capsule GPU-memory isolation** is now available via trust domains
+  (see below): capsules in different domains run in different broker processes, so a hostile
+  custom kernel cannot address another domain's GPU memory. Within one domain, `custom_kernels`
+  is still a trust boundary (shared GPU address space) — put untrusted custom-kernel capsules
+  in their own domain, or run with `--isolate`.
 * Splitting covers built-ins. Custom kernels could declare a split spec (per-arg item
   stride + count param) at registration.
 * No sharing of compiled SBPL profiles yet. Caching would cut most of the 14 ms startup.

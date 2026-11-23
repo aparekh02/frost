@@ -75,6 +75,9 @@ impl Default for Config {
 pub struct Report {
     pub name: String,
     pub pid: i32,
+    /// PID of the broker process whose GPU address space served this capsule. Capsules with
+    /// different `broker_pid` are in different GPU VA spaces (separate trust domains).
+    pub broker_pid: i32,
     pub exit: Option<i32>,
     pub signal: Option<i32>,
     pub killed_for: Option<String>,
@@ -130,6 +133,7 @@ impl Slot {
         Report {
             name: self.name.clone(),
             pid: self.pid.load(Ordering::Relaxed),
+            broker_pid: std::process::id() as i32,
             exit: st.and_then(|s| s.code()),
             signal: st.and_then(|s| s.signal()),
             killed_for: self.killed_for.lock().unwrap().clone(),

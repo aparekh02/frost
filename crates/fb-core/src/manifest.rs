@@ -20,6 +20,7 @@
 //! gpu_ms_per_sec = 800           # GPU time budget (token bucket)
 //! max_percent = 25               # OR: cap GPU time at 25% (overrides gpu_ms_per_sec)
 //! max_inflight = 4               # cap command buffers in flight (instantaneous occupancy)
+//! trust_domain = "tenant-a"      # isolation unit: own broker process = own GPU address space
 //! custom_kernels = false         # allow runtime MSL registration (trust boundary!)
 //!
 //! [sandbox]
@@ -113,6 +114,13 @@ pub struct Gpu {
     /// the GPU it can occupy *instantaneously*, even inside its time budget.
     #[serde(default = "d_inflight")]
     pub max_inflight: u32,
+    /// Trust domain. Capsules sharing a domain run in one broker process (shared GPU address
+    /// space: fine-grained cross-capsule scheduling and zero-copy possible). Capsules in
+    /// different domains run in **separate broker processes** — separate GPU virtual address
+    /// spaces, so a hostile custom kernel in one can't reach another's GPU memory. Unset =
+    /// the shared `"default"` domain; `frostd run --isolate` puts every capsule in its own.
+    #[serde(default)]
+    pub trust_domain: Option<String>,
     #[serde(default)]
     pub custom_kernels: bool,
 }
@@ -124,6 +132,7 @@ impl Default for Gpu {
             gpu_ms_per_sec: d_gpu_budget(),
             max_percent: None,
             max_inflight: d_inflight(),
+            trust_domain: None,
             custom_kernels: false,
         }
     }
@@ -178,6 +187,11 @@ impl Manifest {
         let s = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         Self::parse(&s).with_context(|| format!("parse {}", path.display()))
     }
+    /// The broker process this capsule belongs to (its trust domain). Capsules with the same
+    /// domain share one broker; different domains are isolated in separate processes.
+    pub fn trust_domain(&self) -> String {
+        self.gpu.trust_domain.clone().unwrap_or_else(|| "default".to_string())
+    }
     pub fn parse(s: &str) -> Result<Manifest> {
         let m: Manifest = toml::from_str(s)?;
         anyhow::ensure!(
@@ -187,6 +201,10 @@ impl Manifest {
         anyhow::ensure!(m.gpu.arena_mb >= 1 && m.gpu.arena_mb <= 8192, "gpu.arena_mb out of range");
         anyhow::ensure!(m.gpu.max_percent.is_none_or(|p| p >= 1 && p <= 100), "gpu.max_percent must be 1..=100");
         anyhow::ensure!(m.gpu.max_inflight >= 1 && m.gpu.max_inflight <= 64, "gpu.max_inflight must be 1..=64");
+        anyhow::ensure!(
+            m.gpu.trust_domain.as_ref().is_none_or(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')),
+            "gpu.trust_domain must be [A-Za-z0-9_-]+"
+        );
         Ok(m)
     }
 }

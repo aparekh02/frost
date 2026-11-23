@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! frostd info
-//! frostd run [--rt] [--quiet] [--idle-spin-us N] [--json] <capsule.toml>...
+//! frostd run [--rt] [--quiet] [--isolate] [--json] <capsule.toml>...
+//!     --isolate: run each capsule in its own broker process (its own GPU address space)
 //! frostd bench-direct [--iters N]
 //! frostd profile <capsule.toml>         # print the generated Seatbelt profile
 //! frostd serve [--socket PATH] [run flags]   # long-lived daemon
@@ -63,10 +64,20 @@ fn default_socket() -> std::path::PathBuf {
     Config::default().run_dir.join("frostd.sock")
 }
 
-/// Parse shared daemon flags; returns (config, --json, --socket, positional args).
-fn parse_flags(args: &[String]) -> Result<(Config, bool, std::path::PathBuf, Vec<String>)> {
+struct Flags {
+    cfg: Config,
+    json: bool,
+    /// Put every capsule in its own trust domain (its own broker process).
+    isolate: bool,
+    socket: std::path::PathBuf,
+    manifests: Vec<String>,
+}
+
+/// Parse shared daemon flags.
+fn parse_flags(args: &[String]) -> Result<Flags> {
     let mut cfg = Config::default();
     let mut json = false;
+    let mut isolate = false;
     let mut socket = default_socket();
     let mut manifests = Vec::new();
     let mut it = args.iter();
@@ -76,6 +87,7 @@ fn parse_flags(args: &[String]) -> Result<(Config, bool, std::path::PathBuf, Vec
             "--rt" => cfg.realtime_dispatcher = true,
             "--quiet" => cfg.quiet = true,
             "--json" => json = true,
+            "--isolate" => isolate = true,
             "--no-watchdog" => cfg.watchdog = false,
             "--slice-us" => cfg.slice_us = it.next().context("--slice-us N")?.parse()?,
             "--no-slicing" => cfg.slice_us = 0,
@@ -85,7 +97,43 @@ fn parse_flags(args: &[String]) -> Result<(Config, bool, std::path::PathBuf, Vec
             m => manifests.push(m.to_string()),
         }
     }
-    Ok((cfg, json, socket, manifests))
+    Ok(Flags { cfg, json, isolate, socket, manifests })
+}
+
+/// Flags to forward to a per-domain broker (`frostd serve`) subprocess.
+fn passthrough_flags(cfg: &Config) -> Vec<String> {
+    let mut v = vec!["--run-dir".to_string(), cfg.run_dir.display().to_string(), "--idle-spin-us".to_string(), cfg.idle_spin_us.to_string()];
+    if cfg.realtime_dispatcher {
+        v.push("--rt".into());
+    }
+    if cfg.quiet {
+        v.push("--quiet".into());
+    }
+    if !cfg.watchdog {
+        v.push("--no-watchdog".into());
+    }
+    if cfg.slice_us == 0 {
+        v.push("--no-slicing".into());
+    } else {
+        v.push("--slice-us".into());
+        v.push(cfg.slice_us.to_string());
+    }
+    if cfg.keepwarm_us > 0 {
+        v.push("--keepwarm-us".into());
+        v.push(cfg.keepwarm_us.to_string());
+    }
+    v
+}
+
+/// Send one JSON command to a broker's control socket and read its one-line reply.
+fn broker_cmd(socket: &Path, req: &serde_json::Value) -> Result<serde_json::Value> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut s = std::os::unix::net::UnixStream::connect(socket)
+        .with_context(|| format!("connect broker {}", socket.display()))?;
+    writeln!(s, "{req}")?;
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line)?;
+    Ok(serde_json::from_str(&line)?)
 }
 
 fn load_and_launch(d: &std::sync::Arc<Daemon>, m: &str) -> Result<String> {
@@ -101,7 +149,8 @@ fn load_and_launch(d: &std::sync::Arc<Daemon>, m: &str) -> Result<String> {
 fn serve(args: &[String]) -> Result<()> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
-    let (cfg, _, socket, _) = parse_flags(args)?;
+    let f = parse_flags(args)?;
+    let (cfg, socket) = (f.cfg, f.socket);
     let d = Daemon::start(cfg)?;
     let _ = std::fs::remove_file(&socket);
     let l = UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
@@ -139,7 +188,8 @@ fn serve(args: &[String]) -> Result<()> {
 
 fn ctl(args: &[String]) -> Result<()> {
     use std::io::{BufRead, BufReader, Write};
-    let (_, _, socket, pos) = parse_flags(args)?;
+    let f = parse_flags(args)?;
+    let (socket, pos) = (f.socket, f.manifests);
     let req = match pos.first().map(String::as_str) {
         Some("launch") => {
             let m = std::fs::canonicalize(pos.get(1).context("launch <capsule.toml>")?)?;
@@ -171,43 +221,173 @@ fn ctl(args: &[String]) -> Result<()> {
 }
 
 fn run(args: &[String]) -> Result<()> {
-    let (cfg, json, _, manifests) = parse_flags(args)?;
-    if manifests.is_empty() {
+    let f = parse_flags(args)?;
+    if f.manifests.is_empty() {
         bail!("run: no capsule manifests given");
     }
-    let d = Daemon::start(cfg)?;
+    // Decide domains. More than one distinct trust domain (or --isolate) means each domain
+    // runs in its own broker *process* — separate GPU address spaces, hardware-isolated.
+    let domains: std::collections::BTreeSet<String> = f
+        .manifests
+        .iter()
+        .filter_map(|m| Manifest::load(Path::new(m)).ok())
+        .map(|man| if f.isolate { man.name } else { man.trust_domain() })
+        .collect();
+    if f.isolate || domains.len() > 1 {
+        run_supervised(&f)
+    } else {
+        run_in_process(&f)
+    }
+}
+
+/// Single shared broker in this process (the default; behaviour unchanged).
+fn run_in_process(f: &Flags) -> Result<()> {
+    let d = Daemon::start(f.cfg.clone())?;
     let mut failed = false;
-    for m in &manifests {
+    for m in &f.manifests {
         if let Err(e) = load_and_launch(&d, m) {
             eprintln!("frostd: launch {m}: {e:#}");
             failed = true;
         }
     }
     d.wait_all();
-    let reports: Vec<_> = d.slots().iter().map(|s| s.report()).collect();
+    let reports: Vec<serde_json::Value> =
+        d.slots().iter().map(|s| serde_json::to_value(s.report()).unwrap()).collect();
     d.shutdown();
-    if json {
-        println!("REPORT {}", serde_json::to_string(&reports)?);
-    } else {
-        println!("\n{:<16} {:>7} {:>6} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8}  notes", "capsule", "exit", "jobs", "gpu ms", "cpu ms", "wall ms", "peak MiB", "thr ms", "start ms");
-        for r in &reports {
-            let exit = match (r.exit, r.signal) {
-                (Some(c), _) => c.to_string(),
-                (_, Some(s)) => format!("sig{s}"),
-                _ => "?".into(),
-            };
-            println!(
-                "{:<16} {:>7} {:>6} {:>9.2} {:>9.1} {:>9.1} {:>9.1} {:>8.1} {:>8.2}  {}",
-                r.name, exit, r.jobs, r.gpu_ms, r.cpu_ms, r.wall_ms, r.peak_footprint_mb, r.throttled_ms,
-                r.startup_ms.unwrap_or(f64::NAN),
-                r.killed_for.clone().unwrap_or_default()
-            );
-        }
-    }
+    print_reports(f.json, &reports);
     if failed {
         bail!("one or more capsules failed to launch");
     }
     Ok(())
+}
+
+/// One broker process per trust domain. Capsules in different domains therefore live in
+/// different GPU virtual address spaces — a hostile custom kernel in one cannot address
+/// another's GPU memory.
+fn run_supervised(f: &Flags) -> Result<()> {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    std::fs::create_dir_all(&f.cfg.run_dir)?;
+    let exe = std::env::current_exe().context("current_exe")?;
+    let sup = std::process::id();
+
+    // Resolve each manifest to (abspath, domain), reporting parse failures like the old path.
+    let mut failed = false;
+    let mut caps: Vec<(std::path::PathBuf, String)> = Vec::new();
+    for m in &f.manifests {
+        match Manifest::load(Path::new(m)) {
+            Ok(man) => {
+                let dom = if f.isolate { man.name.clone() } else { man.trust_domain() };
+                match std::fs::canonicalize(m) {
+                    Ok(p) => caps.push((p, dom)),
+                    Err(e) => {
+                        eprintln!("frostd: launch {m}: {e:#}");
+                        failed = true;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("frostd: launch {m}: {e:#}");
+                failed = true;
+            }
+        }
+    }
+
+    // Spawn one broker (`frostd serve`) per distinct domain.
+    struct Worker {
+        sock: std::path::PathBuf,
+        child: std::process::Child,
+    }
+    let mut workers: std::collections::BTreeMap<String, Worker> = std::collections::BTreeMap::new();
+    for (_, dom) in &caps {
+        if workers.contains_key(dom) {
+            continue;
+        }
+        let sock = f.cfg.run_dir.join(format!("broker-{sup}-{dom}.sock"));
+        let _ = std::fs::remove_file(&sock);
+        let mut a = vec!["serve".to_string(), "--socket".to_string(), sock.display().to_string()];
+        a.extend(passthrough_flags(&f.cfg));
+        let child = Command::new(&exe).args(&a).spawn().with_context(|| format!("spawn broker for domain '{dom}'"))?;
+        let t0 = Instant::now();
+        while !sock.exists() {
+            anyhow::ensure!(t0.elapsed() < Duration::from_secs(15), "broker for domain '{dom}' did not come up");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        workers.insert(dom.clone(), Worker { sock, child });
+    }
+    eprintln!("frostd: supervising {} broker process(es) [{}] — separate GPU address spaces", workers.len(), workers.keys().cloned().collect::<Vec<_>>().join(", "));
+
+    // Launch each capsule into its domain's broker.
+    let mut launched = 0usize;
+    for (path, dom) in &caps {
+        let req = serde_json::json!({"cmd": "launch", "manifest": path.display().to_string()});
+        match broker_cmd(&workers[dom].sock, &req) {
+            Ok(r) if r["ok"] == true => launched += 1,
+            Ok(r) => {
+                eprintln!("frostd: launch {}: {}", path.display(), r["err"]);
+                failed = true;
+            }
+            Err(e) => {
+                eprintln!("frostd: launch {}: {e:#}", path.display());
+                failed = true;
+            }
+        }
+    }
+
+    // Poll every broker until all launched capsules have exited, then collect reports.
+    let reports = loop {
+        let mut all: Vec<serde_json::Value> = Vec::new();
+        for w in workers.values() {
+            if let Ok(r) = broker_cmd(&w.sock, &serde_json::json!({"cmd": "ps"})) {
+                if let Some(arr) = r["capsules"].as_array() {
+                    all.extend(arr.iter().cloned());
+                }
+            }
+        }
+        if all.len() >= launched && all.iter().all(|r| r["alive"] != true) {
+            break all;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    // Shut the brokers down (joins their log pumps, flushing capsule RESULT lines) then print.
+    for w in workers.values() {
+        let _ = broker_cmd(&w.sock, &serde_json::json!({"cmd": "shutdown"}));
+    }
+    for (_, mut w) in workers {
+        let _ = w.child.wait();
+        let _ = std::fs::remove_file(&w.sock);
+    }
+    print_reports(f.json, &reports);
+    if failed {
+        bail!("one or more capsules failed to launch");
+    }
+    Ok(())
+}
+
+/// Print capsule reports (as JSON Values) either as a `REPORT` json line or a table.
+fn print_reports(json: bool, reports: &[serde_json::Value]) {
+    if json {
+        println!("REPORT {}", serde_json::Value::Array(reports.to_vec()));
+        return;
+    }
+    let g = |r: &serde_json::Value, k: &str| r[k].as_f64().unwrap_or(0.0);
+    println!("\n{:<16} {:>7} {:>6} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8}  notes", "capsule", "exit", "jobs", "gpu ms", "cpu ms", "wall ms", "peak MiB", "broker", "start ms");
+    for r in reports {
+        let exit = match (r["exit"].as_i64(), r["signal"].as_i64()) {
+            (Some(c), _) => c.to_string(),
+            (_, Some(s)) => format!("sig{s}"),
+            _ => "?".into(),
+        };
+        println!(
+            "{:<16} {:>7} {:>6} {:>9.2} {:>9.1} {:>9.1} {:>9.1} {:>8} {:>8.2}  {}",
+            r["name"].as_str().unwrap_or(""), exit, r["jobs"].as_u64().unwrap_or(0),
+            g(r, "gpu_ms"), g(r, "cpu_ms"), g(r, "wall_ms"), g(r, "peak_footprint_mb"),
+            r["broker_pid"].as_i64().unwrap_or(0),
+            r["startup_ms"].as_f64().unwrap_or(f64::NAN),
+            r["killed_for"].as_str().unwrap_or(""),
+        );
+    }
 }
 
 /// Baseline: dispatch latency when the workload owns Metal directly (no broker).
