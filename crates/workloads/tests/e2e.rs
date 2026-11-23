@@ -259,6 +259,34 @@ fn isolate_flag_gives_each_capsule_its_own_broker() {
 }
 
 #[test]
+fn custom_kernel_capsule_cannot_reach_another_domains_arena() {
+    // Issue #1 acceptance: a capsule with custom_kernels = true can do pointer arithmetic
+    // inside its own MSL, so within a domain it is a trust boundary. Put it in its *own*
+    // trust domain, next to a victim, and it runs in a separate broker process — a separate
+    // GPU virtual address space — so a hostile kernel cannot address the victim's arena.
+    // The victim's correct hash output is the integrity marker.
+    let victim = "name = \"victim\"\nargs = [\"--n\", \"65536\", \"--len\", \"77\", \"--rounds\", \"2\"]\n[gpu]\narena_mb = 16\ntrust_domain = \"safe\"";
+    let attacker = "name = \"attacker\"\n[gpu]\narena_mb = 1\ncustom_kernels = true\ntrust_domain = \"evil\"";
+    let r = run(&[], &[("crypto-hash", victim), ("evil", attacker)]);
+
+    // Different trust domains => different broker processes => different GPU address spaces.
+    let pv = r.report("victim")["broker_pid"].as_i64().unwrap();
+    let pa = r.report("attacker")["broker_pid"].as_i64().unwrap();
+    assert_ne!(pv, pa, "a custom-kernel capsule must not share a GPU address space with a victim");
+
+    // The attacker's out-of-bounds buffer references are still rejected by bounds checks,
+    let e = r.result("evil");
+    for k in ["header", "huge", "wrap", "unaligned"] {
+        assert!(e[k].as_str().unwrap().contains("OutOfBounds"), "{k} not contained: {}", e[k]);
+    }
+    assert_eq!(e["still_works"], true);
+
+    // and the victim's arena is intact — nothing leaked or was corrupted across the boundary.
+    assert_eq!(r.result("crypto_hash")["mismatches"], 0, "victim arena was corrupted across domains");
+    assert_eq!(r.report("victim")["exit"], 0);
+}
+
+#[test]
 fn priority_slicing_protects_latency() {
     let lat = "name = \"lat\"\nargs = [\"--iters\", \"1500\", \"--delay-ms\", \"1800\", \"--pipeline\", \"2000\"]\n[cpu]\nclass = \"performance\"\n[gpu]\narena_mb = 1\npriority = 100";
     let flood = "name = \"flood\"\nargs = [\"--n\", \"1048576\", \"--len\", \"200\", \"--rounds\", \"400\"]\n[cpu]\nclass = \"efficiency\"\n[memory]\nlimit_mb = 512\n[gpu]\narena_mb = 300";
