@@ -77,7 +77,9 @@ fn main() -> anyhow::Result<()> {
     let dump_every: usize = workloads::arg("--dump-every", 1);
 
     let mut fb = Frost::connect()?;
-    fb.wait_mode = WaitMode::Park { spin_ns: 50_000 };
+    // --spin = busy-wait for each frame (lowest latency, keeps the GPU warm); default parks
+    // (saves CPU between frames but lets the GPU downclock).
+    fb.wait_mode = if workloads::flag("--spin") { WaitMode::Spin } else { WaitMode::Park { spin_ns: 50_000 } };
     if workloads::flag("--rt") {
         fb.enter_realtime()?;
     }

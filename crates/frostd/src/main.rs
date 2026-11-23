@@ -5,6 +5,7 @@
 //! frostd run [--rt] [--quiet] [--isolate] [--json] <capsule.toml>...
 //!     --isolate: run each capsule in its own broker process (its own GPU address space)
 //! frostd bench-direct [--iters N]
+//! frostd bench-gravity [--frames N] [--balls N] [--width W] [--height H]  # GPU-direct + CPU baselines
 //! frostd profile <capsule.toml>         # print the generated Seatbelt profile
 //! frostd serve [--socket PATH] [run flags]   # long-lived daemon
 //! frostd ctl [--socket PATH] launch <capsule.toml> | ps | kill <name> | shutdown
@@ -34,6 +35,7 @@ fn real_main() -> Result<()> {
         "info" => info(),
         "run" => run(rest),
         "bench-direct" => bench_direct(rest),
+        "bench-gravity" => bench_gravity(rest),
         "serve" => serve(rest),
         "ctl" => ctl(rest),
         "profile" => {
@@ -415,5 +417,123 @@ fn bench_direct(args: &[String]) -> Result<()> {
         }
         println!("direct-metal noop round trip ({mode:>4}): {}", fb_core::time::Summary::of(&mut samples));
     }
+    Ok(())
+}
+
+/// GVertex matching fb-gpu/src/render.metal (48 bytes).
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Default)]
+struct GVertex {
+    color: [f32; 4],
+    pos: [f32; 2],
+    center: [f32; 2],
+    radius: f32,
+    _pad: [f32; 3],
+}
+
+/// Baselines for "with vs without the gravity containerization": render the same gravity
+/// scene (a) directly on the GPU in-process (no broker, no sandbox) and (b) on the CPU (no
+/// GPU acceleration). Compare these against `frostd run capsules/gravity.toml`, which renders
+/// it through the containerized bridge.
+fn bench_gravity(args: &[String]) -> Result<()> {
+    use fb_core::time::{now_ns, Summary};
+    let argn = |name: &str, d: usize| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (w, h) = (argn("--width", 854), argn("--height", 480));
+    let balls = argn("--balls", 16);
+    let frames = argn("--frames", 1200);
+    let cpu_frames = argn("--cpu-frames", 120).min(frames);
+    let _ = fb_core::sched::set_thread_qos(fb_core::sched::Qos::UserInteractive);
+
+    // --- shared initial scene (same seed/motion as the gravity capsule)
+    let floor_y = h as f32 - h as f32 * 0.08;
+    let palette = [[1.0, 0.42, 0.42f32], [0.3, 0.8, 0.77], [1.0, 0.85, 0.24], [0.66, 0.42, 1.0], [0.42, 0.8, 1.0], [1.0, 0.62, 0.26]];
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rng = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((seed >> 40) as f32) / (1u64 << 24) as f32 };
+    let mut pos0 = vec![[0f32; 2]; balls];
+    let mut vel0 = vec![[0f32; 2]; balls];
+    let mut rad = vec![0f32; balls];
+    let mut col = vec![[0f32; 4]; balls];
+    for i in 0..balls {
+        rad[i] = 12.0 + rng() * 28.0;
+        pos0[i] = [rad[i] + rng() * (w as f32 - 2.0 * rad[i]), rng() * floor_y * 0.6];
+        vel0[i] = [(rng() - 0.5) * 10.0, rng() * 3.0];
+        let c = palette[i % palette.len()];
+        col[i] = [c[0], c[1], c[2], 1.0];
+    }
+    const G: f32 = 0.45;
+    const REST: f32 = 0.82;
+    let step = |pos: &mut [[f32; 2]], vel: &mut [[f32; 2]]| {
+        for i in 0..balls {
+            vel[i][1] += G;
+            pos[i][0] += vel[i][0];
+            pos[i][1] += vel[i][1];
+            let r = rad[i];
+            if pos[i][0] < r { pos[i][0] = r; vel[i][0] = -vel[i][0] * REST; }
+            else if pos[i][0] > w as f32 - r { pos[i][0] = w as f32 - r; vel[i][0] = -vel[i][0] * REST; }
+            if pos[i][1] > floor_y - r { pos[i][1] = floor_y - r; vel[i][1] = -vel[i][1] * REST; vel[i][0] *= 0.99; }
+        }
+    };
+
+    // ---------- (a) direct GPU, no container: hardware render pipeline in-process ----------
+    let g = fb_gpu::Gpu::new()?;
+    let q = g.new_queue()?;
+    let stride = g.fb_stride_bytes(w);
+    let fb_buf = g.alloc(h * stride)?;
+    let target = g.make_target(&fb_buf, 0, w, h)?;
+    let max_verts = 12 + 6 * balls;
+    let vbuf = g.alloc(max_verts * std::mem::size_of::<GVertex>())?;
+    let verts = unsafe { std::slice::from_raw_parts_mut(vbuf.as_ptr() as *mut GVertex, max_verts) };
+    let (mut pos, mut vel) = (pos0.clone(), vel0.clone());
+    let z = [0.0f32, 0.0];
+    let mut put = |v: &mut [GVertex], n: &mut usize, p: [f32; 2], c2: [f32; 2], r: f32, c: [f32; 4]| { v[*n] = GVertex { color: c, pos: p, center: c2, radius: r, _pad: [0.0; 3] }; *n += 1; };
+    let (mut rt, mut gpu) = (Vec::with_capacity(frames), Vec::with_capacity(frames));
+    let t_start = now_ns();
+    for _ in 0..frames {
+        step(&mut pos, &mut vel);
+        let mut n = 0usize;
+        let top = [0.05, 0.07, 0.12, 1.0]; let bot = [0.10, 0.13, 0.22, 1.0]; let fl = [0.18, 0.20, 0.26, 1.0];
+        for (p, c) in [([0.0, 0.0], top), ([w as f32, 0.0], top), ([w as f32, h as f32], bot), ([0.0, 0.0], top), ([w as f32, h as f32], bot), ([0.0, h as f32], bot)] { put(verts, &mut n, p, z, 0.0, c); }
+        for p in [[0.0, floor_y], [w as f32, floor_y], [w as f32, h as f32], [0.0, floor_y], [w as f32, h as f32], [0.0, h as f32]] { put(verts, &mut n, p, z, 0.0, fl); }
+        for i in 0..balls {
+            let (cx, cy, r) = (pos[i][0], pos[i][1], rad[i]);
+            for p in [[cx - r, cy - r], [cx + r, cy - r], [cx + r, cy + r], [cx - r, cy - r], [cx + r, cy + r], [cx - r, cy + r]] { put(verts, &mut n, p, [cx, cy], r, col[i]); }
+        }
+        let t0 = now_ns();
+        let d = g.render(&q, &target, &vbuf, 0, n)?.spin();
+        rt.push(now_ns() - t0);
+        gpu.push(d.gpu_ns);
+    }
+    let fps = frames as f64 / ((now_ns() - t_start) as f64 / 1e9);
+    println!("direct-metal, NO container : {fps:>7.0} fps  frame {}", Summary::of(&mut rt));
+    println!("   gpu render time         : {}", Summary::of(&mut gpu));
+
+    // ---------- (b) CPU only, no GPU acceleration: software rasterizer ----------
+    let (mut pos, mut vel) = (pos0.clone(), vel0.clone());
+    let mut fbc = vec![0u32; w * h];
+    let mut rtc = Vec::with_capacity(cpu_frames);
+    let t_start = now_ns();
+    for _ in 0..cpu_frames {
+        step(&mut pos, &mut vel);
+        let t0 = now_ns();
+        for y in 0..h {
+            let v = y as f32 / h as f32;
+            let base = if (y as f32) > floor_y { [0.18, 0.20, 0.26] } else { [0.05 + 0.05 * v, 0.07 + 0.06 * v, 0.12 + 0.10 * v] };
+            for x in 0..w {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let mut c = base;
+                for i in 0..balls {
+                    let d = ((px - pos[i][0]).powi(2) + (py - pos[i][1]).powi(2)).sqrt();
+                    let cov = (rad[i] - d + 0.5).clamp(0.0, 1.0);
+                    if cov > 0.0 { for k in 0..3 { c[k] = c[k] * (1.0 - cov) + col[i][k] * cov; } }
+                }
+                fbc[y * w + x] = 0xff00_0000 | ((c[2] * 255.0) as u32) << 16 | ((c[1] * 255.0) as u32) << 8 | (c[0] * 255.0) as u32;
+            }
+        }
+        rtc.push(now_ns() - t0);
+    }
+    std::hint::black_box(&fbc);
+    let fpsc = cpu_frames as f64 / ((now_ns() - t_start) as f64 / 1e9);
+    println!("cpu only,  NO gpu          : {fpsc:>7.0} fps  frame {}", Summary::of(&mut rtc));
+    println!("\n(compare 'frostd run capsules/gravity.toml' for the containerized GPU bridge: same render, sandboxed + brokered)");
     Ok(())
 }

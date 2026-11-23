@@ -16,8 +16,21 @@ cargo build --release
 ./target/release/frostd run capsules/lat-under-load.toml capsules/hash-flood.toml   # priority slicing
 ./target/release/frostd run capsules/gravity.toml     # a game rendered on the GPU through the bridge
 ./target/release/frostd run capsules/gravity-demo.toml && open /tmp/gravity-frames   # viewable PPM frames
+scripts/gravity-vs.sh                                 # the game WITH vs WITHOUT the bridge (GPU vs CPU)
 scripts/bench.sh                                      # reproduce all headline numbers
 ```
+
+With vs without the gravity containerization, same game (854×480, 16 balls) on an M4:
+
+| | fps | frame p50 | notes |
+|---|---|---|---|
+| **containerized GPU bridge** | ~2,250 | ~370 µs | sandboxed capsule, brokered, resource-capped |
+| direct Metal, no container | ~2,900 | ~307 µs | ~22% faster — that's the bridge's overhead |
+| CPU only, no GPU | ~86 | ~11.6 ms | no acceleration |
+
+So the GPU path is ≈**26× the fps** of CPU (the render itself ≈145×), and the containerization
+costs ~22% of that for sandboxing, resource caps and cross-container isolation — both GPU paths
+are far above real-time. Reproduce with `scripts/gravity-vs.sh`.
 
 > The `gravity` capsule is the interactive answer to "run a game on the GPU." It is **not**
 > a Linux container — Linux on macOS runs in a VM with no Metal access, which is the reason

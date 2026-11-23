@@ -231,6 +231,7 @@ checksum, for both paths).
 | Wake lateness, 500 µs period, 14 hogs | timeshare p99 4.9–50 ms (178–1,862 misses) → **RT p99 4.8 µs, 0 misses** |
 | High-prio GPU latency next to a 97%-busy flood | p90 **5,744 → 141 µs**, p99 **6,886 → 228 µs** with slicing; flood keeps ~83% of throughput |
 | `gravity` game (hardware render), 854×480, 16 balls | **~1,625 fps**, frame p50 **448 µs**, GPU render p50 **80 µs** |
+| same game, **with vs without the bridge** (854×480, 16 balls) | containerized GPU **~2,250 fps** (frame p50 ~370 µs) · direct Metal, no container **~2,900 fps** (~22% faster) · **CPU only ~86 fps** (frame p50 ~11.6 ms). GPU vs CPU ≈ **26× fps**, render itself ≈ **145×**; containment costs ~22% fps for sandbox + caps + isolation. `scripts/gravity-vs.sh` |
 | `gravity` hardware render vs compute raster, 1280×720, 4,000 sprites | **536 fps** (GPU 1.2 ms) vs **18 fps** (GPU 52.6 ms) — hardware raster ~30× |
 | `gravity` next to a 97%-busy GPU flood | no slicing **562 fps** (p99 12.5 ms) → with slicing **1,476 fps** (p99 3.4 ms) |
 | GPU budget 100 ms/s | 9.8% GPU busy observed |
