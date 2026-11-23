@@ -108,15 +108,32 @@ taking pointers (MSL needs an explicit address space), and dynamic parallelism.
 | SAXPY, 16M f32, GPU | ~2.4 ms, result verified vs CPU |
 | GHZ(3) sampling, 10k shots | ~50/50 on \|000⟩ / \|111⟩ |
 | QFT, **22 qubits** (4.19M amplitudes, 253 gates) | evolved on GPU in ~108 ms |
-| Test suite | 16 tests (classical + quantum + C ABI) pass on-device |
+| Test suite | 17 tests (classical + quantum + C ABI + unmodified SDK sample) pass on-device |
 
 SAXPY is bandwidth-bound, so its CPU/GPU ratio is modest; compute-dense kernels (GEMM,
 quantum evolution) are where the GPU pulls ahead.
 
+## Relation to issue #9 (NVIDIA CUDA support)
+
+Issue #9 scopes two backends. This crate delivers **Option A — local CUDA→Metal**:
+
+| #9 item | Status |
+|---|---|
+| Milestone 1 — spike one kernel (SAXPY) through CUDA → MSL, verified vs built-ins | ✅ `examples/saxpy.rs`, `tests/classical.rs` |
+| Milestone 2 — minimal runtime shim and run an **unmodified CUDA sample** | ✅ `tests/sample.rs` runs the NVIDIA `vectorAdd` sample kernel verbatim through `cuInit`→`cuLaunchKernel` |
+| Runtime shim — `libcudart`/`libcuda`-compatible layer | ✅ 22 exported symbols in `libfb_cuda.dylib` (`tests/abi.rs`) |
+| Mapping — warp↔simdgroup, `__shared__`↔`threadgroup`, `__syncthreads`↔`threadgroup_barrier` | ✅ `src/translate.rs` |
+| Milestone 3 — perf comparison translated vs native MSL | ◻️ partial (see Measured table) |
+| **Option B — remote NVIDIA lane** (`frostd-remote`, real cuBLAS/cuDNN/PTX) | ◻️ **not built** — tracked separately |
+
+The compile path here is **source-to-source** (CUDA-C subset → MSL via `newLibraryWithSource`),
+not #9's suggested clang→SPIR-V→SPIRV-Cross pipeline. That trades broad `.cu` ingestion for a
+dependency-free runtime; full PTX/SASS and cuBLAS/cuDNN parity remain non-goals (Option B).
+
 ## Tests
 
 ```
-cargo test -p fb-cuda          # classical.rs, quantum.rs, abi.rs — all run on the GPU
+cargo test -p fb-cuda          # classical.rs, quantum.rs, abi.rs, sample.rs — all run on the GPU
 cargo run -p fb-cuda --release --example saxpy
 cargo run -p fb-cuda --release --example quantum_ghz
 ```
