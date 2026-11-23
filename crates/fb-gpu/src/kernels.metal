@@ -126,3 +126,60 @@ kernel void fb_sha256_batch(device const uchar* in [[buffer(0)]],
         o[i*4+2] = (uchar)(h[i] >> 8);  o[i*4+3] = (uchar)(h[i]);
     }
 }
+
+// ---------------------------------------------------------------- id 6: gravity_render
+// A compute-shader rasterizer for the interactive "gravity" plane. One thread per pixel
+// writes one RGBA8 texel into a framebuffer that lives in the capsule's shared arena, so
+// the rendered frame is visible to the capsule's CPU with zero copy (unified memory).
+//
+//   buffer(0): framebuffer, width*height packed RGBA8 (one uint per pixel, 0xAABBGGRR)
+//   buffer(1): scene, an array of Ball {float2 pos; float radius; uint rgba}  (16 B each)
+//   buffer(2): params -> p.w, p.h, p.n_balls, p.frame
+// Launch grid = {width, height, 1}. Cost is O(pixels * balls); with a handful of balls a
+// 854x480 frame is a few hundred microseconds on an M-series GPU.
+struct Ball { float2 pos; float radius; uint rgba; };
+struct SceneParams { uint w; uint h; uint n_balls; uint frame; };
+
+static inline uint pack_rgba(float3 c) {
+    c = clamp(c, 0.0f, 1.0f);
+    uint r = (uint)(c.r * 255.0f + 0.5f);
+    uint g = (uint)(c.g * 255.0f + 0.5f);
+    uint b = (uint)(c.b * 255.0f + 0.5f);
+    return 0xff000000u | (b << 16) | (g << 8) | r;   // little-endian RGBA
+}
+static inline float3 unpack_rgb(uint v) {
+    return float3(float(v & 0xff), float((v >> 8) & 0xff), float((v >> 16) & 0xff)) / 255.0f;
+}
+
+kernel void fb_gravity_render(device uint* fb         [[buffer(0)]],
+                              device const Ball* scene [[buffer(1)]],
+                              constant SceneParams& p  [[buffer(2)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    float2 px = float2(gid) + 0.5f;
+
+    // Background: a vertical gradient with a subtle animated shimmer, plus a floor band.
+    float t = float(p.frame) * 0.03f;
+    float v = float(gid.y) / float(p.h);
+    float3 top = float3(0.05f, 0.07f, 0.12f);
+    float3 bot = float3(0.10f, 0.13f, 0.22f);
+    float3 col = mix(top, bot, v) + 0.015f * sin(px.x * 0.05f + t);
+
+    float floor_y = float(p.h) - float(p.h) * 0.08f;
+    if (px.y > floor_y) col = float3(0.18f, 0.20f, 0.26f);
+
+    // Composite each ball with a cheap radial shade + 1px coverage anti-aliasing.
+    for (uint i = 0; i < p.n_balls; ++i) {
+        Ball b = scene[i];
+        float d = distance(px, b.pos);
+        float cov = clamp(b.radius - d + 0.5f, 0.0f, 1.0f);
+        if (cov <= 0.0f) continue;
+        float3 base = unpack_rgb(b.rgba);
+        // normal from the 2D disc -> lambert-ish highlight for a 3D look
+        float2 n = (b.pos - px) / max(b.radius, 1.0f);
+        float h = clamp(dot(normalize(float2(-0.5f, -0.7f)), n) * 0.5f + 0.6f, 0.0f, 1.0f);
+        float3 shaded = base * (0.35f + 0.65f * h);
+        col = mix(col, shaded, cov);
+    }
+    fb[gid.y * p.w + gid.x] = pack_rgba(col);
+}

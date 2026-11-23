@@ -63,6 +63,7 @@ impl Gpu {
             (kernel::SHA256_BATCH, "fb_sha256_batch"),
             (kernel::NOOP, "fb_noop"),
             (kernel::SAXPY_F32, "fb_saxpy_f32"),
+            (kernel::GRAVITY_RENDER, "fb_gravity_render"),
         ] {
             g.install(id, entry.trim_start_matches("fb_"), BUILTIN_SRC, entry)?;
         }

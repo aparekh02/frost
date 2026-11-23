@@ -48,7 +48,8 @@ provide natively, and puts one trusted process, `frostd`, in charge of the GPU.
 | Crate        | Role |
 |--------------|------|
 | `fb-core`    | ABI (arena header, `Job`, `Completion`), SPSC rings in shared memory, arenas, manifest, scheduling (RT, QoS, rusage), `os_sync_wait_on_address` doorbells |
-| `fb-gpu`     | Metal: device, per-capsule queues, kernel registry (built-in MSL + custom), zero-copy wrap, validated batch encoding, job splitting |
+| `fb-gpu`     | Metal: device, per-capsule queues, kernel registry (built-in MSL + custom, incl. the `gravity_render` rasterizer), zero-copy wrap, validated batch encoding, job splitting |
+| `fb-cuda`    | CUDA-compatible runtime over Metal (`cuda` branch): CUDA Driver/Runtime C ABI, CUDA-C→MSL translation, and a CUDA-Q-style GPU statevector simulator. Not NVIDIA CUDA — a compatibility layer for Apple Silicon. See `crates/fb-cuda/README.md` |
 | `fb-capsule` | Seatbelt profile generation and process spawning |
 | `fb-client`  | What a workload links: connect from inherited fds, bump-allocate GPU memory, submit/wait |
 | `frostd`     | Supervisor + broker: `run`, `serve`, `ctl`, `info`, `profile`, `bench-direct` |
@@ -120,6 +121,51 @@ order, subject to:
   (e.g. all 16 layers of an MLP token)
 * **Keep-warm** (optional, `--keepwarm-us`): tiny periodic dispatch to hold GPU clocks
 
+## Gravity: the interactive frame plane
+
+> **Can it run a containerized Linux game?** No — and that limitation is the premise of
+> this whole project. A Linux game container on macOS runs in a VM that has **no Metal
+> access** (see "Why not Docker?"), so it cannot touch this GPU bridge at all. What *can*
+> use the bridge is Frost Bridge's own container primitive: a Seatbelt-sandboxed **native
+> capsule**. The `gravity` capsule is exactly that — a game that runs with no filesystem,
+> no network and no GPU entitlement of its own, reaching the GPU only through `frostd`.
+
+The compute kernels (vadd, gemv, sha256, mlp) produce *numbers*. A game produces *frames*,
+so the `gravity` plane adds one more built-in kernel and reuses everything else unchanged:
+
+```
+ gravity capsule (sandboxed)                     frostd dispatcher            GPU
+ ┌─────────────────────────┐                     ┌──────────────┐
+ │ step physics (CPU)       │                     │ same lane as  │
+ │  balls, gravity, bounce  │                     │ compute: prio,│
+ │ write Ball[] ─▶ scene ───┼── submit ring ──▶   │ token bucket, │──▶ fb_gravity_render
+ │                          │                     │ slicing       │    1 thread / pixel
+ │ read framebuffer ◀───────┼◀── (zero copy) ─────┼──────────────┘    writes RGBA8
+ │  (already mapped here)    │   complete ring     framebuffer lives in the arena
+ └─────────────────────────┘
+```
+
+* **`gravity_render` (kernel id 6).** A compute-shader rasterizer: launch grid = one thread
+  per pixel, `buffer(0)` the framebuffer (`width*height` packed RGBA8), `buffer(1)` a
+  `Ball{pos, radius, rgba}` scene array, params `{w, h, n_balls, frame}`. It draws a
+  background gradient, a floor band, and each ball with a radial shade and 1px coverage AA.
+  It is **not** splittable (a frame renders atomically) and bounds-checks against its count
+  params like the other built-ins.
+* **Zero-copy framebuffer.** The framebuffer is just a bump allocation in the capsule's
+  arena, which the daemon already wraps as one `MTLBuffer`. The GPU writes the frame and the
+  capsule's CPU reads it back through an ordinary slice — no texture upload, no `glReadPixels`,
+  no copy across a VM boundary. That is the "direct bridge": the pixels never leave unified
+  memory.
+* **It's just another lane.** The game gets a `priority`, a `gpu_ms_per_sec` budget, a
+  per-capsule queue and preemption-by-slicing for free. A high-priority game therefore holds
+  its frame rate next to a GPU compute flood (measured below) — the bridge *is* the GPU
+  optimization: one trusted scheduler arbitrating the device instead of every workload
+  racing for it.
+
+Headless it reports frames/s and per-frame GPU time; `--dump DIR` writes the frames as PPM
+images. Rendering is deterministic for a given seed (the e2e test renders twice and compares
+a checksum of the final frame).
+
 ## Measured (Apple M4, 4P+6E, 16 GB, macOS 27)
 
 | Metric | Result |
@@ -131,6 +177,8 @@ order, subject to:
 | MLP 8×1024², per token | **587 µs p50, about 1,625 tok/s**, rel err 1.4e-6 (CPU 1-thread: 3.9 ms) |
 | Wake lateness, 500 µs period, 14 hogs | timeshare p99 4.9–50 ms (178–1,862 misses) → **RT p99 4.8 µs, 0 misses** |
 | High-prio GPU latency next to a 97%-busy flood | p90 **5,744 → 141 µs**, p99 **6,886 → 228 µs** with slicing; flood keeps ~83% of throughput |
+| `gravity` game, 854×480, 16 balls | **~1,450 fps**, frame latency p50 **583 µs**, GPU render p50 **346 µs** |
+| `gravity` next to a 97%-busy GPU flood | no slicing **562 fps** (p99 12.5 ms) → with slicing **1,476 fps** (p99 3.4 ms) |
 | GPU budget 100 ms/s | 9.8% GPU busy observed |
 | Memory limit 128 MiB | killed at 128.8 MiB peak |
 | Startup | ~14 ms sandboxed (warm), 2.4 ms unsandboxed |

@@ -112,6 +112,28 @@ fn gpu_workloads_are_correct() {
 }
 
 #[test]
+fn gravity_renders_frames() {
+    // The interactive "gravity" plane: a sandboxed capsule renders a game on the GPU
+    // through the broker, into a zero-copy framebuffer in its arena.
+    let caps = "name = \"game\"\nargs = [\"--frames\", \"200\", \"--balls\", \"12\", \"--width\", \"640\", \"--height\", \"360\"]\n[cpu]\nclass = \"performance\"\n[gpu]\narena_mb = 8\npriority = 50";
+    let a = run(&[], &[("gravity", caps)]);
+    let g = a.result("gravity");
+    assert_eq!(a.report("game")["exit"], 0);
+    assert_eq!(g["frames"], 200);
+    // It actually drew something (not a blank buffer) ...
+    assert_ne!(g["checksum"].as_u64().unwrap(), 0);
+    // ... and rendering is deterministic: the same seed yields a byte-identical last frame.
+    let b = run(&[], &[("gravity", caps)]);
+    assert_eq!(g["checksum"], b.result("gravity")["checksum"], "render is not reproducible");
+    // Frames land fast enough to be interactive (well above 60 fps even sandboxed).
+    let fps = g["fps"].as_f64().unwrap();
+    assert!(fps > 120.0, "only {fps:.0} fps");
+    let gpu_p50 = g["gpu_render"]["p50_us"].as_f64().unwrap();
+    println!("gravity: {fps:.0} fps, gpu render p50 {gpu_p50:.0}us");
+    assert!(gpu_p50 < 5000.0, "gpu render p50 {gpu_p50}us too slow");
+}
+
+#[test]
 fn gpu_budget_is_enforced() {
     let r = run(&[], &[("crypto-hash", "name = \"budget\"\nargs = [\"--n\", \"1048576\", \"--len\", \"200\", \"--rounds\", \"15\"]\n[cpu]\nclass = \"performance\"\n[memory]\nlimit_mb = 512\n[gpu]\narena_mb = 300\ngpu_ms_per_sec = 100")]);
     let busy = r.result("crypto_hash")["gpu_busy"].as_f64().unwrap();

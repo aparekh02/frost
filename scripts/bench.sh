@@ -13,3 +13,5 @@ for mode in --no-slicing ""; do
   echo; echo "### high-prio latency next to a GPU flood ${mode:-(slicing on)}"
   $F run $mode capsules/lat-under-load.toml capsules/hash-flood.toml 2>/dev/null | grep -E "round trip .spin|sha256" | grep -v RESULT | sed 's/^\[[^]]*\] *//'
 done
+echo; echo "### gravity: a game rendered on the GPU through the bridge"
+$F run capsules/gravity.toml 2>/dev/null | grep -E "gravity:|gpu render" | grep -v RESULT | sed 's/^\[[^]]*\] *//'

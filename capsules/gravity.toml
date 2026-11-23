@@ -1,0 +1,9 @@
+name = "gravity"
+exec = "../target/release/gravity"
+args = ["--frames", "1200", "--balls", "16"]
+[cpu]
+class = "performance"
+[gpu]
+arena_mb = 16
+priority = 50
+gpu_ms_per_sec = 1000

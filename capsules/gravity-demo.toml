@@ -1,0 +1,12 @@
+# Writes viewable PPM frames to /tmp/gravity-frames. The sandbox is disabled only so the
+# capsule may write outside its own root; the headless `gravity.toml` keeps it on.
+name = "gravity-demo"
+exec = "../target/release/gravity"
+args = ["--frames", "180", "--dump", "/tmp/gravity-frames", "--dump-every", "2"]
+[cpu]
+class = "performance"
+[gpu]
+arena_mb = 16
+priority = 50
+[sandbox]
+enabled = false

@@ -14,8 +14,16 @@ cargo build --release
 ./target/release/frostd run capsules/probe.toml       # what can a capsule do? (almost nothing)
 ./target/release/frostd run capsules/crypto-hash.toml capsules/infer-mlp.toml
 ./target/release/frostd run capsules/lat-under-load.toml capsules/hash-flood.toml   # priority slicing
+./target/release/frostd run capsules/gravity.toml     # a game rendered on the GPU through the bridge
+./target/release/frostd run capsules/gravity-demo.toml && open /tmp/gravity-frames   # viewable PPM frames
 scripts/bench.sh                                      # reproduce all headline numbers
 ```
+
+> The `gravity` capsule is the interactive answer to "run a game on the GPU." It is **not**
+> a Linux container — Linux on macOS runs in a VM with no Metal access, which is the reason
+> Frost Bridge exists. It is a native, Seatbelt-sandboxed capsule whose frames are rasterized
+> by the `gravity_render` GPU kernel straight into zero-copy unified memory. See
+> ARCHITECTURE.md § "Gravity: the interactive frame plane".
 
 Long-lived daemon:
 
@@ -57,7 +65,8 @@ let c = fb.run(fb.job("saxpy_f32").arg(x).arg(y).grid(n as u32).param(n as u32).
 println!("gpu {} ns", c.gpu_ns);
 ```
 
-Built-in kernels: `vadd_f32`, `saxpy_f32`, `gemv_f32`, `sha256_batch`, `noop`. With
+Built-in kernels: `vadd_f32`, `saxpy_f32`, `gemv_f32`, `sha256_batch`, `noop`,
+`gravity_render` (a compute-shader rasterizer for the interactive frame plane). With
 `gpu.custom_kernels = true`, `fb.register_kernel(name, msl_source, entry)` adds your own.
 
 ## Tests
@@ -74,7 +83,7 @@ Latest run (Apple M4, macOS 27.0.1, Rust 1.98.1): **24 passed, 0 failed, 1 ignor
 | `fb-core` unit | 6/6 ✅ | SPSC ring ordering over 2M items, full/empty, **corrupted peer indices contained**, ABI layout stable, manifest validation, cross-thread `os_sync` wake |
 | `fb-capsule` unit | 2/2 ✅ | Seatbelt profile is deny-by-default; a sandboxed shell can't read `/etc/hosts` or write outside its root |
 | `fb-gpu` integration | 7/7 ✅ | zero-copy dispatch on a file-backed `mmap`; SHA-256 (lengths 0–200 B) and GEMV match the CPU; out-of-window/overflow/bad-kernel rejected; custom MSL kernels; **split jobs byte-identical to unsplit**; dropped uncommitted batches don't abort |
-| `workloads` end-to-end | 8/8 ✅ | real `frostd` + real sandboxed capsules (details below) |
+| `workloads` end-to-end | 9/9 ✅ | real `frostd` + real sandboxed capsules (details below) |
 | `fb-client` doctest | 1/1 ✅ | API example compiles |
 
 End-to-end results from that run:
@@ -88,6 +97,7 @@ End-to-end results from that run:
 | `gpu_workloads_are_correct` | 0 SHA-256 mismatches; MLP rel. error < 1e-3 |
 | `gpu_budget_is_enforced` | 100 ms/s budget → < 16% GPU busy (≈ 9.8% typical) |
 | `priority_slicing_protects_latency` | high-prio p90 under a GPU flood: **6,823 µs → 152 µs** |
+| `gravity_renders_frames` | sandboxed game renders on the GPU through the bridge; deterministic (checksum reproducible), **> 120 fps** even at test size |
 | `realtime_policy_bounds_jitter` | p99 wake lateness under 14 CPU hogs: **14,620 µs → 3.5 µs**, 0 misses |
 
 ## Benchmark results

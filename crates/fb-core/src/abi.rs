@@ -94,6 +94,8 @@ pub mod kernel {
     pub const SHA256_BATCH: u32 = 3;
     pub const NOOP: u32 = 4;
     pub const SAXPY_F32: u32 = 5;
+    /// Rasterize a frame into an RGBA8 framebuffer (the "gravity" interactive plane).
+    pub const GRAVITY_RENDER: u32 = 6;
     pub const FIRST_CUSTOM: u32 = 1000;
 }
 
