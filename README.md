@@ -22,15 +22,16 @@ scripts/bench.sh                                      # reproduce all headline n
 
 With vs without the gravity containerization, same game (854×480, 16 balls) on an M4:
 
-| | fps | frame p50 | notes |
-|---|---|---|---|
-| **containerized GPU bridge** | ~2,250 | ~370 µs | sandboxed capsule, brokered, resource-capped |
-| direct Metal, no container | ~2,900 | ~307 µs | ~22% faster — that's the bridge's overhead |
-| CPU only, no GPU | ~86 | ~11.6 ms | no acceleration |
+| | fps | notes |
+|---|---|---|
+| CPU only, no GPU | ~86 | no acceleration (frame p50 ~11.6 ms) |
+| direct Metal, no container | ~2,440 | synchronous submit→wait |
+| **containerized bridge, depth 1** | ~2,490 | ≈ direct Metal — **containment is essentially free** |
+| **containerized bridge, depth 8** | **~14,100** | **pipelined** (`--depth 8`): frames overlap → GPU-bound |
 
-So the GPU path is ≈**26× the fps** of CPU (the render itself ≈145×), and the containerization
-costs ~22% of that for sandboxing, resource caps and cross-container isolation — both GPU paths
-are far above real-time. Reproduce with `scripts/gravity-vs.sh`.
+So the GPU path is **~29× the fps** of CPU (the render itself ~145×); the containerization adds
+~0 overhead at matched submission strategy; and pipelining through the bridge reaches GPU-bound
+throughput (5.7× over synchronous). Reproduce with `scripts/gravity-vs.sh`.
 
 > The `gravity` capsule is the interactive answer to "run a game on the GPU." It is **not**
 > a Linux container — Linux on macOS runs in a VM with no Metal access, which is the reason
@@ -124,7 +125,7 @@ Latest run (Apple M4, macOS 27.0.1, Rust 1.98.1): **24 passed, 0 failed, 1 ignor
 | `fb-core` unit | 6/6 ✅ | SPSC ring ordering over 2M items, full/empty, **corrupted peer indices contained**, ABI layout stable, manifest validation, cross-thread `os_sync` wake |
 | `fb-capsule` unit | 2/2 ✅ | Seatbelt profile is deny-by-default; a sandboxed shell can't read `/etc/hosts` or write outside its root |
 | `fb-gpu` integration | 7/7 ✅ | zero-copy dispatch on a file-backed `mmap`; SHA-256 (lengths 0–200 B) and GEMV match the CPU; out-of-window/overflow/bad-kernel rejected; custom MSL kernels; **split jobs byte-identical to unsplit**; dropped uncommitted batches don't abort |
-| `workloads` end-to-end | 14/14 ✅ | real `frostd` + real sandboxed capsules (details below) |
+| `workloads` end-to-end | 15/15 ✅ | real `frostd` + real sandboxed capsules (details below) |
 | `fb-client` doctest | 1/1 ✅ | API example compiles |
 
 End-to-end results from that run:
@@ -144,6 +145,7 @@ End-to-end results from that run:
 | `priority_slicing_protects_latency` | high-prio p90 under a GPU flood: **6,823 µs → 152 µs** |
 | `gravity_renders_frames` | sandboxed game renders on the GPU (both render + compute paths); deterministic (checksum reproducible), **> 120 fps** |
 | `gravity_hardware_render_beats_compute` | the hardware rasterizer spends less GPU time per frame than the compute software rasterizer |
+| `gravity_pipelining_raises_throughput` | `--depth 4` (multi-buffered, pipelined) raises fps >1.5× over depth 1, frames byte-identical |
 | `realtime_policy_bounds_jitter` | p99 wake lateness under 14 CPU hogs: **14,620 µs → 3.5 µs**, 0 misses |
 
 ## Benchmark results

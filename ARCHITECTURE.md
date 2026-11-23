@@ -214,10 +214,20 @@ so the `gravity` plane accelerates graphics the way a real engine does: it hands
   optimization: one trusted scheduler arbitrating the device instead of every workload
   racing for it. Neither render job is splittable (a frame draws atomically).
 
+* **Pipelining (`--depth N`).** Submitting one frame and waiting for it is round-trip bound
+  (~2,500 fps here). With `--depth N` the capsule keeps N frames in flight — N framebuffers and
+  N vertex buffers in its arena, submitting frame k+N only after frame k retires — so work
+  overlaps and throughput becomes GPU-bound (**~14,100 fps at depth 8, 5.7×**). The daemon
+  caches a render-target texture per framebuffer offset so multi-buffering doesn't rebuild
+  textures. Frames stay byte-identical to depth 1 (tested). At matched submission strategy the
+  brokered path (depth 1 ≈ 2,490 fps) equals direct Metal (≈ 2,440 fps) — the container is
+  essentially free; pipelining is the lever for throughput, and it works just as well through
+  the bridge.
+
 Headless the capsule reports frames/s and per-frame GPU time; `--dump DIR` writes the frames
-as PPM images, `--mode compute` selects the software path, `--balls N` scales the scene.
-Rendering is deterministic for a given seed (the e2e test renders twice and compares a
-checksum, for both paths).
+as PPM images, `--mode compute` selects the software path, `--balls N` scales the scene,
+`--depth N` pipelines, `--spin` busy-waits (lowest latency). Rendering is deterministic for a
+given seed (the e2e tests render twice and compare a checksum, across paths and depths).
 
 ## Measured (Apple M4, 4P+6E, 16 GB, macOS 27)
 
@@ -231,7 +241,7 @@ checksum, for both paths).
 | Wake lateness, 500 µs period, 14 hogs | timeshare p99 4.9–50 ms (178–1,862 misses) → **RT p99 4.8 µs, 0 misses** |
 | High-prio GPU latency next to a 97%-busy flood | p90 **5,744 → 141 µs**, p99 **6,886 → 228 µs** with slicing; flood keeps ~83% of throughput |
 | `gravity` game (hardware render), 854×480, 16 balls | **~1,625 fps**, frame p50 **448 µs**, GPU render p50 **80 µs** |
-| same game, **with vs without the bridge** (854×480, 16 balls) | containerized GPU **~2,250 fps** (frame p50 ~370 µs) · direct Metal, no container **~2,900 fps** (~22% faster) · **CPU only ~86 fps** (frame p50 ~11.6 ms). GPU vs CPU ≈ **26× fps**, render itself ≈ **145×**; containment costs ~22% fps for sandbox + caps + isolation. `scripts/gravity-vs.sh` |
+| same game, **with vs without the bridge** (854×480, 16 balls, spin) | **CPU only ~86 fps** (frame p50 11.6 ms) → direct Metal, no container **~2,440 fps** → containerized bridge depth 1 **~2,490 fps** (containment is ≈free) → **pipelined depth 8 ~14,100 fps** (5.7×). GPU vs CPU ≈ **29× fps**, render itself ≈ **145×**. `scripts/gravity-vs.sh` |
 | `gravity` hardware render vs compute raster, 1280×720, 4,000 sprites | **536 fps** (GPU 1.2 ms) vs **18 fps** (GPU 52.6 ms) — hardware raster ~30× |
 | `gravity` next to a 97%-busy GPU flood | no slicing **562 fps** (p99 12.5 ms) → with slicing **1,476 fps** (p99 3.4 ms) |
 | GPU budget 100 ms/s | 9.8% GPU busy observed |

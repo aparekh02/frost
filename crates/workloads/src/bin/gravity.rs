@@ -84,17 +84,28 @@ fn main() -> anyhow::Result<()> {
         fb.enter_realtime()?;
     }
     let sp = if render_mode { stride_px(w) } else { w };
+    // Pipeline depth: keep this many frames in flight at once (multi-buffered) so throughput
+    // is bound by the GPU, not the per-frame submit→complete round trip. Dumping needs frames
+    // read back in order, so it forces depth 1. Compute mode stays single-buffered.
+    let mut depth: usize = if render_mode { workloads::arg("--depth", 1usize).max(1) } else { 1 };
+    if dump.is_some() {
+        depth = 1;
+    }
     eprintln!(
-        "gravity: {}, {w}x{h}, {n_balls} balls, {frames} frames on {}",
+        "gravity: {}, {w}x{h}, {n_balls} balls, {frames} frames, depth {depth} on {}",
         if render_mode { "hardware render pipeline" } else { "compute rasterizer" },
         fb.gpu_name
     );
 
-    // Arena buffers: framebuffer (GPU writes, CPU reads) + geometry/scene (CPU writes).
-    let fbuf = fb.alloc::<u32>(h * sp)?;
+    // One framebuffer + one vertex buffer per in-flight slot (GPU writes fb, CPU writes verts).
     let max_verts = 12 + 6 * n_balls; // background quad + floor quad + 6 per ball
-    let vbuf = fb.alloc::<GVertex>(max_verts)?;
-    let scene = fb.alloc::<Ball>(n_balls)?; // only used in compute mode
+    let fbufs: Vec<_> = (0..depth).map(|_| fb.alloc::<u32>(h * sp)).collect::<anyhow::Result<Vec<_>>>()?;
+    let vbufs: Vec<_> = if render_mode {
+        (0..depth).map(|_| fb.alloc::<GVertex>(max_verts)).collect::<anyhow::Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    let scene = if render_mode { None } else { Some(fb.alloc::<Ball>(n_balls)?) }; // compute only
 
     // --- initial state (pixels; velocities in px/frame)
     let floor_y = h as f32 - h as f32 * 0.08;
@@ -122,7 +133,26 @@ fn main() -> anyhow::Result<()> {
     let mut latency = Vec::with_capacity(frames);
     let mut gpu = Vec::with_capacity(frames);
     let mut checksum = 0u64;
+    // In-flight frames: (seq, slot, submit time, frame index). Up to `depth` outstanding.
+    let mut inflight: std::collections::VecDeque<(u64, usize, u64, usize)> = std::collections::VecDeque::new();
+    let scene_buf = scene; // Option<BufRef>, Copy
     let t_start = now_ns();
+
+    // Retire one in-flight frame: wait it, record timing, and (depth 1) read it back.
+    let mut retire = |fb: &mut Frost, inflight: &mut std::collections::VecDeque<(u64, usize, u64, usize)>,
+                      gpu: &mut Vec<u64>, latency: &mut Vec<u64>| -> anyhow::Result<()> {
+        let (seq, slot, t_sub, fidx) = inflight.pop_front().unwrap();
+        let c = fb.wait(seq)?;
+        gpu.push(c.gpu_ns);
+        if depth == 1 {
+            latency.push(now_ns() - t_sub);
+        }
+        if let (Some(d), true) = (&dump, fidx % dump_every == 0) {
+            let pixels = fb.view_mut::<u32>(fbufs[slot]);
+            write_ppm(&format!("{d}/frame_{fidx:05}.ppm"), pixels, w, h, sp)?;
+        }
+        Ok(())
+    };
 
     for frame in 0..frames {
         // 1) physics
@@ -145,63 +175,62 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // 2) build geometry / scene, 3) submit, 4) wait
-        let t0 = now_ns();
-        let c = if render_mode {
+        // 2) free this frame's slot by retiring the oldest in-flight frame if we're full
+        if inflight.len() >= depth {
+            retire(&mut fb, &mut inflight, &mut gpu, &mut latency)?;
+        }
+        let slot = frame % depth;
+
+        // 3) build geometry / scene into this slot's buffers, 4) submit (don't wait yet)
+        let t_sub = now_ns();
+        let seq = if render_mode {
             let top = [0.05, 0.07, 0.12, 1.0];
             let bot = [0.10, 0.13, 0.22, 1.0];
             let floor = [0.18, 0.20, 0.26, 1.0];
-            let v = fb.view_mut::<GVertex>(vbuf);
+            let v = fb.view_mut::<GVertex>(vbufs[slot]);
             let mut n = 0usize;
             quad_grad(v, &mut n, 0.0, 0.0, w as f32, h as f32, top, bot);
             quad(v, &mut n, 0.0, floor_y, w as f32, h as f32, floor);
             for i in 0..n_balls {
                 sprite(v, &mut n, pos[i][0], pos[i][1], rad[i], rgb[i]);
             }
-            fb.run(
-                fb.job("draw_triangles")
-                    .arg(fbuf)
-                    .arg(vbuf)
-                    .param(w as u32)
-                    .param(h as u32)
-                    .param(n as u32)
-                    .param(sp as u32),
-            )?
+            fb.submit(
+                fb.job("draw_triangles").arg(fbufs[slot]).arg(vbufs[slot])
+                    .param(w as u32).param(h as u32).param(n as u32).param(sp as u32),
+            )
         } else {
-            let sv = fb.view_mut::<Ball>(scene);
+            let sv = fb.view_mut::<Ball>(scene_buf.unwrap());
             for i in 0..n_balls {
                 sv[i] = Ball { pos: pos[i], radius: rad[i], rgba: rgba[i] };
             }
-            fb.run(
-                fb.job("gravity_render")
-                    .arg(fbuf)
-                    .arg(scene)
+            fb.submit(
+                fb.job("gravity_render").arg(fbufs[0]).arg(scene_buf.unwrap())
                     .grid3([w as u32, h as u32, 1])
-                    .param(w as u32)
-                    .param(h as u32)
-                    .param(n_balls as u32)
-                    .param(frame as u32),
-            )?
+                    .param(w as u32).param(h as u32).param(n_balls as u32).param(frame as u32),
+            )
         };
-        let t1 = now_ns();
-        latency.push(t1 - t0);
-        gpu.push(c.gpu_ns);
-
-        // 5) read the finished frame back (zero copy)
-        let pixels = fb.view_mut::<u32>(fbuf);
-        if frame + 1 == frames {
-            checksum = fnv(pixels, w, h, sp);
-        }
-        if let (Some(d), true) = (&dump, frame % dump_every == 0) {
-            write_ppm(&format!("{d}/frame_{frame:05}.ppm"), pixels, w, h, sp)?;
-        }
+        inflight.push_back((seq, slot, t_sub, frame));
+    }
+    // 5) drain remaining in-flight frames
+    while !inflight.is_empty() {
+        retire(&mut fb, &mut inflight, &mut gpu, &mut latency)?;
+    }
+    // checksum the final frame (zero-copy readback)
+    if frames > 0 {
+        let pixels = fb.view_mut::<u32>(fbufs[(frames - 1) % depth]);
+        checksum = fnv(pixels, w, h, sp);
     }
 
     let wall = now_ns() - t_start;
     let fps = frames as f64 / (wall as f64 / 1e9);
-    let lat = Summary::of(&mut latency);
+    // Per-frame latency is only meaningful at depth 1 (pipelined frames overlap); at higher
+    // depth the headline metric is throughput (fps).
+    let lat = (!latency.is_empty()).then(|| Summary::of(&mut latency));
     let g = Summary::of(&mut gpu);
-    println!("gravity: {fps:.0} fps  frame latency {lat}");
+    match &lat {
+        Some(l) => println!("gravity: {fps:.0} fps  frame latency {l}"),
+        None => println!("gravity: {fps:.0} fps  (depth {depth}, pipelined — see fps)"),
+    }
     println!("   gpu render time             : {g}");
     if let Some(d) = &dump {
         eprintln!("gravity: wrote PPM frames to {d}");
@@ -210,8 +239,9 @@ fn main() -> anyhow::Result<()> {
         "mode": if render_mode { "render" } else { "compute" },
         "fps": fps,
         "frames": frames,
+        "depth": depth,
         "width": w, "height": h, "balls": n_balls,
-        "frame_latency": workloads::summary_json(&lat),
+        "frame_latency": lat.as_ref().map(workloads::summary_json),
         "gpu_render": workloads::summary_json(&g),
         "checksum": checksum,
     }}));

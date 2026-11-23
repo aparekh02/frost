@@ -138,6 +138,23 @@ fn gravity_renders_frames() {
 }
 
 #[test]
+fn gravity_pipelining_raises_throughput() {
+    // Multi-buffered (pipelined) frames overlap on the GPU, so throughput rises sharply with
+    // depth — and the rendered frames stay byte-identical (no buffer reuse corruption).
+    let cap = |depth: u32| format!(
+        "name = \"g\"\nargs = [\"--frames\", \"600\", \"--balls\", \"16\", \"--spin\", \"--depth\", \"{depth}\"]\n[cpu]\nclass = \"performance\"\n[gpu]\narena_mb = 64\npriority = 50"
+    );
+    let a = run(&[], &[("gravity", &cap(1))]);
+    let b = run(&[], &[("gravity", &cap(4))]);
+    let (f1, f4) = (a.result("gravity")["fps"].as_f64().unwrap(), b.result("gravity")["fps"].as_f64().unwrap());
+    println!("gravity fps: depth 1 = {f1:.0}, depth 4 = {f4:.0}");
+    assert_eq!(a.report("g")["exit"], 0);
+    assert_eq!(b.report("g")["exit"], 0);
+    assert!(f4 > f1 * 1.5, "pipelining should raise throughput: {f1:.0} -> {f4:.0}");
+    assert_eq!(a.result("gravity")["checksum"], b.result("gravity")["checksum"], "pipelining corrupted frames");
+}
+
+#[test]
 fn gravity_hardware_render_beats_compute() {
     // The hardware rasterizer (vertex+fragment pipeline) should spend less GPU time per
     // frame than the compute software rasterizer for the same scene.

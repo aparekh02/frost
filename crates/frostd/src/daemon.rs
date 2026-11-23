@@ -185,8 +185,9 @@ struct Lane {
     /// Rolling GPU-utilization window: busy ns accumulated since `util_win_start`.
     util_win_start: u64,
     util_busy_ns: u64,
-    /// Cached render target for the graphics plane (reused across frames of one size).
-    rt: Option<RenderTarget>,
+    /// Cached render targets for the graphics plane, keyed by framebuffer offset, so a
+    /// multi-buffered (pipelined) game reuses a texture per buffer instead of rebuilding it.
+    rt: std::collections::HashMap<u64, RenderTarget>,
     slot: Arc<Slot>,
 }
 
@@ -439,8 +440,8 @@ impl Daemon {
             max_inflight: m.gpu.max_inflight as usize,
             util_win_start: fb_core::time::now_ns(),
             util_busy_ns: 0,
+            rt: std::collections::HashMap::new(),
             priority: m.gpu.priority,
-            rt: None,
         };
         self.slots.lock().unwrap().push(slot.clone());
         self.lanes_tx.send(lane).ok();
@@ -901,14 +902,19 @@ fn render_frame(gpu: &Gpu, l: &mut Lane, j: &Job, t_seen: u64) {
     if a0.off % 256 != 0 || !in_win(a0.off, fb_bytes) || a1.off % 16 != 0 || !in_win(a1.off, v_bytes) {
         return reject(l, j, t_seen, Status::OutOfBounds);
     }
-    let stale = !matches!(&l.rt, Some(rt) if rt.off == a0.off && rt.w == w as u32 && rt.h == h as u32);
+    let stale = !matches!(l.rt.get(&a0.off), Some(rt) if rt.w == w as u32 && rt.h == h as u32);
     if stale {
+        if l.rt.len() >= 64 {
+            l.rt.clear(); // defensive: a capsule shouldn't use this many framebuffers
+        }
         match gpu.make_target(&l.buf, a0.off as usize, w, h) {
-            Ok(t) => l.rt = Some(t),
+            Ok(t) => {
+                l.rt.insert(a0.off, t);
+            }
             Err(_) => return reject(l, j, t_seen, Status::GpuError),
         }
     }
-    let target = l.rt.as_ref().unwrap();
+    let target = l.rt.get(&a0.off).unwrap();
     match gpu.render(&l.queue, target, &l.buf, a1.off as usize, vcount) {
         Ok(cb) => l.inflight.push_back(Pending { cb, jobs: vec![(j.seq, j.kernel, true, 0)], t_seen }),
         Err(_) => reject(l, j, t_seen, Status::GpuError),
