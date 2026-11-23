@@ -100,6 +100,36 @@ fn memory_limit_kills_capsule() {
 }
 
 #[test]
+fn memory_limit_contains_rate_limited_allocator() {
+    // Issue #6 acceptance: at a controlled ~1 GB/s allocation rate, the phys_footprint
+    // watchdog holds the peak within 5% of the limit. (A flat-out allocator is memory-
+    // bandwidth-bound and overshoots further between 2 ms polls — see
+    // `memory_limit_kills_capsule`; that gap is the documented limit of a polling watchdog
+    // versus kernel jetsam, which the kernel ignores for an unprivileged spawner.)
+    const LIMIT_MB: f64 = 128.0;
+    let r = run(&[], &[(
+        "mem-hog",
+        "name = \"slow-hog\"\nargs = [\"--mb\", \"512\", \"--rate-mbps\", \"1024\"]\n[memory]\nlimit_mb = 128\n[gpu]\narena_mb = 1",
+    )]);
+    let rep = r.report("slow-hog");
+    assert_eq!(rep["signal"], 9, "a rate-limited over-limit capsule must still be SIGKILLed: {rep}");
+    assert!(rep["killed_for"].as_str().unwrap().contains("memory"));
+    let peak = rep["peak_footprint_mb"].as_f64().unwrap();
+    println!(
+        "rate-limited (~1 GB/s) peak footprint {peak:.1} MiB vs {LIMIT_MB} MiB limit ({:+.1}% over)",
+        (peak / LIMIT_MB - 1.0) * 100.0
+    );
+    assert!(
+        peak <= LIMIT_MB * 1.05,
+        "peak {peak:.1} MiB exceeds 5% over the {LIMIT_MB} MiB limit (watchdog overshoot too large)"
+    );
+    assert!(
+        r.results.iter().all(|x| x.get("mem_hog_survived").is_none()),
+        "the hog should have been killed before finishing"
+    );
+}
+
+#[test]
 fn gpu_workloads_are_correct() {
     let r = run(&[], &[
         ("crypto-hash", "name = \"hash\"\nargs = [\"--n\", \"65536\", \"--len\", \"77\", \"--rounds\", \"3\"]\n[gpu]\narena_mb = 16"),
