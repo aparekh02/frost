@@ -94,8 +94,13 @@ pub mod kernel {
     pub const SHA256_BATCH: u32 = 3;
     pub const NOOP: u32 = 4;
     pub const SAXPY_F32: u32 = 5;
-    /// Rasterize a frame into an RGBA8 framebuffer (the "gravity" interactive plane).
+    /// Rasterize a frame into an RGBA8 framebuffer with a compute shader (software raster).
     pub const GRAVITY_RENDER: u32 = 6;
+    /// Draw triangles with the GPU's hardware rasterizer (vertex+fragment pipeline) into a
+    /// texture aliasing the arena framebuffer. Routed by the dispatcher, not the compute
+    /// batch. args: [framebuffer, vertex_buffer]; params: [width, height, vertex_count,
+    /// stride_px]. See fb-gpu `render` and `render.metal`.
+    pub const DRAW_TRIANGLES: u32 = 7;
     pub const FIRST_CUSTOM: u32 = 1000;
 }
 

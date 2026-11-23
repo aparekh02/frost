@@ -18,12 +18,19 @@ use std::ptr::NonNull;
 use std::sync::RwLock;
 
 pub const BUILTIN_SRC: &str = include_str!("kernels.metal");
+pub const RENDER_SRC: &str = include_str!("render.metal");
 
 type Dev = ProtocolObject<dyn MTLDevice>;
 type Queue = ProtocolObject<dyn MTLCommandQueue>;
 type Pipe = ProtocolObject<dyn MTLComputePipelineState>;
 type CmdBuf = ProtocolObject<dyn MTLCommandBuffer>;
 type Enc = ProtocolObject<dyn MTLComputeCommandEncoder>;
+type RenderPipe = ProtocolObject<dyn MTLRenderPipelineState>;
+type Tex = ProtocolObject<dyn MTLTexture>;
+
+/// One GVertex is 48 bytes; the capsule writes an array of these into its arena and the
+/// hardware pipeline pulls them by vertex_id. Must match `struct GVertex` in render.metal.
+pub const VERTEX_BYTES: usize = 48;
 
 pub struct Kernel {
     pub name: String,
@@ -38,6 +45,9 @@ pub struct Gpu {
     kernels: RwLock<HashMap<u32, Kernel>>,
     names: RwLock<BTreeMap<String, u32>>,
     next_id: std::sync::atomic::AtomicU32,
+    /// Hardware render pipeline for the graphics plane (built once at startup).
+    render: Option<Retained<RenderPipe>>,
+    tex_align: usize,
 }
 
 // Metal device, queue and pipeline objects are documented thread-safe.
@@ -50,12 +60,17 @@ impl Gpu {
         let queue = dev
             .newCommandQueueWithMaxCommandBufferCount(64)
             .ok_or_else(|| anyhow!("newCommandQueue failed"))?;
-        let g = Gpu {
+        let tex_align = dev
+            .minimumLinearTextureAlignmentForPixelFormat(MTLPixelFormat::RGBA8Unorm)
+            .max(256);
+        let mut g = Gpu {
             dev,
             queue,
             kernels: RwLock::new(HashMap::new()),
             names: RwLock::new(BTreeMap::new()),
             next_id: std::sync::atomic::AtomicU32::new(kernel::FIRST_CUSTOM),
+            render: None,
+            tex_align,
         };
         for (id, entry) in [
             (kernel::VADD_F32, "fb_vadd_f32"),
@@ -67,7 +82,49 @@ impl Gpu {
         ] {
             g.install(id, entry.trim_start_matches("fb_"), BUILTIN_SRC, entry)?;
         }
+        // Hardware graphics pipeline. A pseudo-name so clients can look up its id like a
+        // kernel; it is routed by the dispatcher, never encoded into a compute batch.
+        g.render = Some(g.build_render_pipeline()?);
+        g.names.write().unwrap().insert("draw_triangles".to_string(), kernel::DRAW_TRIANGLES);
         Ok(g)
+    }
+
+    /// Row stride (bytes) a framebuffer of `width` RGBA8 texels needs so it can back a
+    /// texture. Both the daemon and the capsule compute it this way so no stride is
+    /// communicated across the ABI.
+    pub fn fb_stride_bytes(&self, width: usize) -> usize {
+        fb_core::round_up(width * 4, self.tex_align)
+    }
+
+    fn build_render_pipeline(&self) -> Result<Retained<RenderPipe>> {
+        let lib = self
+            .dev
+            .newLibraryWithSource_options_error(&NSString::from_str(RENDER_SRC), None)
+            .map_err(|e| anyhow!("render MSL compile failed: {}", e.localizedDescription()))?;
+        let vf = lib
+            .newFunctionWithName(&NSString::from_str("g_vert"))
+            .ok_or_else(|| anyhow!("vertex function g_vert not found"))?;
+        let ff = lib
+            .newFunctionWithName(&NSString::from_str("g_frag"))
+            .ok_or_else(|| anyhow!("fragment function g_frag not found"))?;
+        let desc = MTLRenderPipelineDescriptor::new();
+        desc.setVertexFunction(Some(&vf));
+        desc.setFragmentFunction(Some(&ff));
+        let att = unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) };
+        att.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+        // Straight-alpha blending so transparent sprites composite correctly.
+        att.setBlendingEnabled(true);
+        att.setRgbBlendOperation(MTLBlendOperation::Add);
+        att.setAlphaBlendOperation(MTLBlendOperation::Add);
+        att.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
+        att.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+        att.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+        att.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+        let state = self
+            .dev
+            .newRenderPipelineStateWithDescriptor_error(&desc)
+            .map_err(|e| anyhow!("render pipeline: {}", e.localizedDescription()))?;
+        Ok(state)
     }
 
     pub fn name(&self) -> String {
@@ -164,6 +221,66 @@ impl Gpu {
         Ok(GpuQueue(q))
     }
 
+    /// Make a texture that aliases `buf[off .. off + h*stride]` as an RGBA8 render target,
+    /// where `stride == fb_stride_bytes(w)`. On Apple Silicon this is zero-copy: the
+    /// hardware rasterizer writes straight into the shared arena pages.
+    pub fn make_target(&self, buf: &GpuBuffer, off: usize, w: usize, h: usize) -> Result<RenderTarget> {
+        let stride = self.fb_stride_bytes(w);
+        let desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA8Unorm,
+                w,
+                h,
+                false,
+            )
+        };
+        desc.setStorageMode(MTLStorageMode::Shared);
+        desc.setUsage(MTLTextureUsage::RenderTarget);
+        let tex = unsafe { buf.buf.newTextureWithDescriptor_offset_bytesPerRow(&desc, off, stride) }
+            .ok_or_else(|| anyhow!("newTextureWithDescriptor failed"))?;
+        Ok(RenderTarget { tex, off: off as u64, w: w as u32, h: h as u32 })
+    }
+
+    /// Hardware-rasterize `vcount` triangle vertices (pulled from `buf` at byte offset
+    /// `vbuf_off`) into `target` with a clear + one draw call. This is the graphics plane:
+    /// vertex + fragment shaders and the GPU's fixed-function rasterizer, not a compute job.
+    pub fn render(
+        &self,
+        q: &GpuQueue,
+        target: &RenderTarget,
+        buf: &GpuBuffer,
+        vbuf_off: usize,
+        vcount: usize,
+    ) -> Result<InFlight> {
+        let state = self.render.as_ref().ok_or_else(|| anyhow!("no render pipeline"))?;
+        let cb = q.0.commandBufferWithUnretainedReferences().ok_or_else(|| anyhow!("commandBuffer failed"))?;
+        let rpd = MTLRenderPassDescriptor::new();
+        let ca = unsafe { rpd.colorAttachments().objectAtIndexedSubscript(0) };
+        ca.setTexture(Some(&target.tex));
+        ca.setLoadAction(MTLLoadAction::Clear);
+        ca.setStoreAction(MTLStoreAction::Store);
+        ca.setClearColor(MTLClearColor { red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0 });
+        let enc = cb
+            .renderCommandEncoderWithDescriptor(&rpd)
+            .ok_or_else(|| anyhow!("renderCommandEncoder failed"))?;
+        enc.setRenderPipelineState(state);
+        let uni = [target.w as f32, target.h as f32];
+        unsafe {
+            enc.setVertexBuffer_offset_atIndex(Some(&buf.buf), vbuf_off, 0);
+            enc.setVertexBytes_length_atIndex(
+                NonNull::new(uni.as_ptr() as *mut c_void).unwrap(),
+                std::mem::size_of_val(&uni),
+                1,
+            );
+        }
+        if vcount > 0 {
+            unsafe { enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, vcount) };
+        }
+        enc.endEncoding();
+        cb.commit();
+        Ok(InFlight { cb: cb.clone() })
+    }
+
     /// Batch on the device's default queue.
     pub fn batch(&self) -> Result<Batch<'_>> {
         self.batch_raw(&self.queue)
@@ -189,6 +306,16 @@ impl Gpu {
 pub struct GpuQueue(Retained<Queue>);
 unsafe impl Send for GpuQueue {}
 unsafe impl Sync for GpuQueue {}
+
+/// A texture aliasing a framebuffer region of a capsule's arena (see [`Gpu::make_target`]).
+pub struct RenderTarget {
+    tex: Retained<Tex>,
+    pub off: u64,
+    pub w: u32,
+    pub h: u32,
+}
+unsafe impl Send for RenderTarget {}
+unsafe impl Sync for RenderTarget {}
 
 pub struct GpuBuffer {
     buf: Retained<ProtocolObject<dyn MTLBuffer>>,

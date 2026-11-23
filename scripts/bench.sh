@@ -13,5 +13,20 @@ for mode in --no-slicing ""; do
   echo; echo "### high-prio latency next to a GPU flood ${mode:-(slicing on)}"
   $F run $mode capsules/lat-under-load.toml capsules/hash-flood.toml 2>/dev/null | grep -E "round trip .spin|sha256" | grep -v RESULT | sed 's/^\[[^]]*\] *//'
 done
-echo; echo "### gravity: a game rendered on the GPU through the bridge"
+echo; echo "### gravity: a game rendered on the GPU through the bridge (hardware render pipeline)"
 $F run capsules/gravity.toml 2>/dev/null | grep -E "gravity:|gpu render" | grep -v RESULT | sed 's/^\[[^]]*\] *//'
+echo; echo "### gravity: hardware rasterizer vs compute rasterizer, 4000 sprites @ 1280x720"
+for m in render compute; do
+  tmp=$(mktemp -d); cat > "$tmp/g.toml" <<EOF
+name = "g"
+exec = "$(pwd)/target/release/gravity"
+args = ["--mode", "$m", "--frames", "400", "--balls", "4000", "--width", "1280", "--height", "720"]
+[cpu]
+class = "performance"
+[gpu]
+arena_mb = 32
+priority = 50
+EOF
+  printf '%-8s ' "$m:"; $F run "$tmp/g.toml" 2>/dev/null | grep -E "gravity:" | grep -v RESULT | sed 's/^\[[^]]*\] *//'
+  rm -rf "$tmp"
+done

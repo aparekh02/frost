@@ -48,7 +48,7 @@ provide natively, and puts one trusted process, `frostd`, in charge of the GPU.
 | Crate        | Role |
 |--------------|------|
 | `fb-core`    | ABI (arena header, `Job`, `Completion`), SPSC rings in shared memory, arenas, manifest, scheduling (RT, QoS, rusage), `os_sync_wait_on_address` doorbells |
-| `fb-gpu`     | Metal: device, per-capsule queues, kernel registry (built-in MSL + custom, incl. the `gravity_render` rasterizer), zero-copy wrap, validated batch encoding, job splitting |
+| `fb-gpu`     | Metal: device, per-capsule queues, kernel registry (built-in MSL + custom), zero-copy wrap, validated batch encoding, job splitting, and the **hardware render pipeline** (vertex+fragment, texture aliasing an arena framebuffer) for the graphics plane |
 | `fb-cuda`    | CUDA-compatible runtime over Metal (`cuda` branch): CUDA Driver/Runtime C ABI, CUDA-C→MSL translation, and a CUDA-Q-style GPU statevector simulator. Not NVIDIA CUDA — a compatibility layer for Apple Silicon. See `crates/fb-cuda/README.md` |
 | `fb-capsule` | Seatbelt profile generation and process spawning |
 | `fb-client`  | What a workload links: connect from inherited fds, bump-allocate GPU memory, submit/wait |
@@ -121,7 +121,7 @@ order, subject to:
   (e.g. all 16 layers of an MLP token)
 * **Keep-warm** (optional, `--keepwarm-us`): tiny periodic dispatch to hold GPU clocks
 
-## Gravity: the interactive frame plane
+## Gravity: the GPU graphics plane
 
 > **Can it run a containerized Linux game?** No — and that limitation is the premise of
 > this whole project. A Linux game container on macOS runs in a VM that has **no Metal
@@ -131,40 +131,51 @@ order, subject to:
 > no network and no GPU entitlement of its own, reaching the GPU only through `frostd`.
 
 The compute kernels (vadd, gemv, sha256, mlp) produce *numbers*. A game produces *frames*,
-so the `gravity` plane adds one more built-in kernel and reuses everything else unchanged:
+so the `gravity` plane accelerates graphics the way a real engine does: it hands the GPU
+**geometry**, and the **hardware rasterizer** turns it into pixels. There are two paths.
 
 ```
- gravity capsule (sandboxed)                     frostd dispatcher            GPU
- ┌─────────────────────────┐                     ┌──────────────┐
- │ step physics (CPU)       │                     │ same lane as  │
- │  balls, gravity, bounce  │                     │ compute: prio,│
- │ write Ball[] ─▶ scene ───┼── submit ring ──▶   │ token bucket, │──▶ fb_gravity_render
- │                          │                     │ slicing       │    1 thread / pixel
- │ read framebuffer ◀───────┼◀── (zero copy) ─────┼──────────────┘    writes RGBA8
- │  (already mapped here)    │   complete ring     framebuffer lives in the arena
- └─────────────────────────┘
+ gravity capsule (sandboxed)                 frostd dispatcher              GPU
+ ┌──────────────────────────┐               ┌───────────────────┐
+ │ step physics (CPU)        │               │ same lane as       │   RENDER (default):
+ │ build triangles:          │               │ compute: priority, │   MTLRenderCommandEncoder
+ │  bg · floor · 1 sprite/   ├─ submit ring ─▶ token bucket,      ├─▶ vertex → fragment →
+ │  ball (6 verts) ─▶ vbuf   │  (DRAW_        │ slicing, per-      │   fixed-function raster
+ │                           │   TRIANGLES)   │ capsule queue      │   into a texture that
+ │ read framebuffer ◀────────┼◀ (zero copy) ──┤                    │   ALIASES the arena
+ │  (already mapped here)     │  complete ring └───────────────────┘   framebuffer
+ └──────────────────────────┘                                       COMPUTE: fb_gravity_render
 ```
 
-* **`gravity_render` (kernel id 6).** A compute-shader rasterizer: launch grid = one thread
-  per pixel, `buffer(0)` the framebuffer (`width*height` packed RGBA8), `buffer(1)` a
-  `Ball{pos, radius, rgba}` scene array, params `{w, h, n_balls, frame}`. It draws a
-  background gradient, a floor band, and each ball with a radial shade and 1px coverage AA.
-  It is **not** splittable (a frame renders atomically) and bounds-checks against its count
-  params like the other built-ins.
-* **Zero-copy framebuffer.** The framebuffer is just a bump allocation in the capsule's
-  arena, which the daemon already wraps as one `MTLBuffer`. The GPU writes the frame and the
-  capsule's CPU reads it back through an ordinary slice — no texture upload, no `glReadPixels`,
-  no copy across a VM boundary. That is the "direct bridge": the pixels never leave unified
-  memory.
-* **It's just another lane.** The game gets a `priority`, a `gpu_ms_per_sec` budget, a
+* **Hardware render pipeline (`draw_triangles`, kernel id 7) — the accelerated path.** The
+  capsule writes triangle geometry into its arena: a gradient background quad, a floor quad,
+  and one quad per ball tagged with a center+radius. The daemon routes the job to an
+  `MTLRenderCommandEncoder` (not the compute batch): a vertex shader maps pixel coordinates
+  to clip space, and a fragment shader draws each ball as an **analytically anti-aliased,
+  shaded disc** with straight-alpha blending. Geometry is *vertex-pulled* from the arena by
+  `vertex_id`, so there is no vertex-descriptor negotiation; one `GVertex` is 48 bytes.
+* **The texture aliases the arena.** The render target is an `MTLTexture` created with
+  `newTextureWithDescriptor:offset:bytesPerRow:` **over the capsule's framebuffer buffer**.
+  On Apple Silicon's unified memory the fixed-function rasterizer therefore writes straight
+  into the same physical pages the capsule reads — no render-to-texture-then-blit, no
+  `glReadPixels`, no copy. Rows are padded to the device's linear-texture alignment
+  (`Gpu::fb_stride_bytes`), which both daemon and capsule compute identically so no stride
+  crosses the ABI. The daemon bounds-checks the framebuffer and vertex `BufRef`s against the
+  capsule's data window before the GPU ever sees them, exactly like a compute job.
+* **Compute rasterizer (`gravity_render`, kernel id 6) — kept for contrast.** A compute
+  shader, one thread per pixel, that loops over the scene. Correct, but O(pixels × balls):
+  at 4,000 sprites it is ~30–45× slower than the hardware path (measured below), which only
+  shades covered fragments. This is the honest reason games use the rasterizer.
+* **It's just another lane.** Either path gets a `priority`, a `gpu_ms_per_sec` budget, a
   per-capsule queue and preemption-by-slicing for free. A high-priority game therefore holds
   its frame rate next to a GPU compute flood (measured below) — the bridge *is* the GPU
   optimization: one trusted scheduler arbitrating the device instead of every workload
-  racing for it.
+  racing for it. Neither render job is splittable (a frame draws atomically).
 
-Headless it reports frames/s and per-frame GPU time; `--dump DIR` writes the frames as PPM
-images. Rendering is deterministic for a given seed (the e2e test renders twice and compares
-a checksum of the final frame).
+Headless the capsule reports frames/s and per-frame GPU time; `--dump DIR` writes the frames
+as PPM images, `--mode compute` selects the software path, `--balls N` scales the scene.
+Rendering is deterministic for a given seed (the e2e test renders twice and compares a
+checksum, for both paths).
 
 ## Measured (Apple M4, 4P+6E, 16 GB, macOS 27)
 
@@ -177,7 +188,8 @@ a checksum of the final frame).
 | MLP 8×1024², per token | **587 µs p50, about 1,625 tok/s**, rel err 1.4e-6 (CPU 1-thread: 3.9 ms) |
 | Wake lateness, 500 µs period, 14 hogs | timeshare p99 4.9–50 ms (178–1,862 misses) → **RT p99 4.8 µs, 0 misses** |
 | High-prio GPU latency next to a 97%-busy flood | p90 **5,744 → 141 µs**, p99 **6,886 → 228 µs** with slicing; flood keeps ~83% of throughput |
-| `gravity` game, 854×480, 16 balls | **~1,450 fps**, frame latency p50 **583 µs**, GPU render p50 **346 µs** |
+| `gravity` game (hardware render), 854×480, 16 balls | **~1,625 fps**, frame p50 **448 µs**, GPU render p50 **80 µs** |
+| `gravity` hardware render vs compute raster, 1280×720, 4,000 sprites | **536 fps** (GPU 1.2 ms) vs **18 fps** (GPU 52.6 ms) — hardware raster ~30× |
 | `gravity` next to a 97%-busy GPU flood | no slicing **562 fps** (p99 12.5 ms) → with slicing **1,476 fps** (p99 3.4 ms) |
 | GPU budget 100 ms/s | 9.8% GPU busy observed |
 | Memory limit 128 MiB | killed at 128.8 MiB peak |

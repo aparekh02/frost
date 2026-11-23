@@ -113,24 +113,41 @@ fn gpu_workloads_are_correct() {
 
 #[test]
 fn gravity_renders_frames() {
-    // The interactive "gravity" plane: a sandboxed capsule renders a game on the GPU
-    // through the broker, into a zero-copy framebuffer in its arena.
-    let caps = "name = \"game\"\nargs = [\"--frames\", \"200\", \"--balls\", \"12\", \"--width\", \"640\", \"--height\", \"360\"]\n[cpu]\nclass = \"performance\"\n[gpu]\narena_mb = 8\npriority = 50";
-    let a = run(&[], &[("gravity", caps)]);
-    let g = a.result("gravity");
-    assert_eq!(a.report("game")["exit"], 0);
-    assert_eq!(g["frames"], 200);
-    // It actually drew something (not a blank buffer) ...
-    assert_ne!(g["checksum"].as_u64().unwrap(), 0);
-    // ... and rendering is deterministic: the same seed yields a byte-identical last frame.
-    let b = run(&[], &[("gravity", caps)]);
-    assert_eq!(g["checksum"], b.result("gravity")["checksum"], "render is not reproducible");
-    // Frames land fast enough to be interactive (well above 60 fps even sandboxed).
-    let fps = g["fps"].as_f64().unwrap();
-    assert!(fps > 120.0, "only {fps:.0} fps");
-    let gpu_p50 = g["gpu_render"]["p50_us"].as_f64().unwrap();
-    println!("gravity: {fps:.0} fps, gpu render p50 {gpu_p50:.0}us");
-    assert!(gpu_p50 < 5000.0, "gpu render p50 {gpu_p50}us too slow");
+    // The "gravity" graphics plane: a sandboxed capsule renders a game on the GPU through
+    // the broker, into a zero-copy framebuffer in its arena. Test both GPU paths.
+    for mode in ["render", "compute"] {
+        let caps = format!(
+            "name = \"game\"\nargs = [\"--mode\", \"{mode}\", \"--frames\", \"200\", \"--balls\", \"12\", \"--width\", \"640\", \"--height\", \"360\"]\n[cpu]\nclass = \"performance\"\n[gpu]\narena_mb = 8\npriority = 50"
+        );
+        let a = run(&[], &[("gravity", &caps)]);
+        let g = a.result("gravity");
+        assert_eq!(a.report("game")["exit"], 0, "{mode}");
+        assert_eq!(g["mode"], mode);
+        assert_eq!(g["frames"], 200);
+        // It actually drew something (not a blank buffer) ...
+        assert_ne!(g["checksum"].as_u64().unwrap(), 0, "{mode} rendered nothing");
+        // ... and rendering is deterministic: the same seed yields a byte-identical frame.
+        let b = run(&[], &[("gravity", &caps)]);
+        assert_eq!(g["checksum"], b.result("gravity")["checksum"], "{mode} not reproducible");
+        let fps = g["fps"].as_f64().unwrap();
+        let gpu_p50 = g["gpu_render"]["p50_us"].as_f64().unwrap();
+        println!("gravity[{mode}]: {fps:.0} fps, gpu render p50 {gpu_p50:.0}us");
+        assert!(fps > 120.0, "{mode}: only {fps:.0} fps");
+        assert!(gpu_p50 < 5000.0, "{mode}: gpu render p50 {gpu_p50}us too slow");
+    }
+}
+
+#[test]
+fn gravity_hardware_render_beats_compute() {
+    // The hardware rasterizer (vertex+fragment pipeline) should spend less GPU time per
+    // frame than the compute software rasterizer for the same scene.
+    let caps = |mode: &str| format!(
+        "name = \"g\"\nargs = [\"--mode\", \"{mode}\", \"--frames\", \"400\", \"--balls\", \"24\"]\n[cpu]\nclass = \"performance\"\n[gpu]\narena_mb = 16\npriority = 50"
+    );
+    let r = run(&[], &[("gravity", &caps("render"))]).result("gravity")["gpu_render"]["p50_us"].as_f64().unwrap();
+    let c = run(&[], &[("gravity", &caps("compute"))]).result("gravity")["gpu_render"]["p50_us"].as_f64().unwrap();
+    println!("gpu render p50: hardware {r:.0}us vs compute {c:.0}us");
+    assert!(r < c, "hardware render ({r:.0}us) should beat compute ({c:.0}us)");
 }
 
 #[test]

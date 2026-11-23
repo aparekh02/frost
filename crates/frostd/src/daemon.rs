@@ -16,7 +16,7 @@ use fb_core::manifest::Manifest;
 use fb_core::proto::{self, ToCapsule, ToDaemon};
 use fb_core::ring::{Consumer, Producer, Ring};
 use fb_core::shm::Arena;
-use fb_gpu::{Gpu, GpuBuffer, GpuQueue, InFlight, Window};
+use fb_gpu::{Gpu, GpuBuffer, GpuQueue, InFlight, RenderTarget, Window};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
@@ -165,6 +165,8 @@ struct Lane {
     last_submit_ns: u64,
     last_refill: u64,
     priority: i32,
+    /// Cached render target for the graphics plane (reused across frames of one size).
+    rt: Option<RenderTarget>,
     slot: Arc<Slot>,
 }
 
@@ -413,6 +415,7 @@ impl Daemon {
             last_submit_ns: 0,
             last_refill: fb_core::time::now_ns(),
             priority: m.gpu.priority,
+            rt: None,
         };
         self.slots.lock().unwrap().push(slot.clone());
         self.lanes_tx.send(lane).ok();
@@ -689,7 +692,7 @@ fn dispatcher(gpu: Arc<Gpu>, cfg: Config, bell: Arc<Arena>, rx: mpsc::Receiver<L
                 continue;
             }
             let mut batch = match gpu.batch_on(&l.queue) {
-                Ok(b) => b,
+                Ok(b) => Some(b),
                 Err(_) => continue,
             };
             let mut jobs = Vec::new();
@@ -723,7 +726,24 @@ fn dispatcher(gpu: Arc<Gpu>, cfg: Config, bell: Arc<Arena>, rx: mpsc::Receiver<L
                 } else {
                     break;
                 };
-                match batch.encode(&l.buf, l.window, &j) {
+                // Graphics plane: a hardware-rasterized frame is not a compute job. Flush any
+                // compute work already batched, draw the frame on its own command buffer, and
+                // end this lane's tick.
+                if j.kernel == abi::kernel::DRAW_TRIANGLES {
+                    if let Some(b) = batch.take() {
+                        if !jobs.is_empty() {
+                            l.inflight.push_back(Pending {
+                                cb: b.commit(),
+                                jobs: std::mem::take(&mut jobs),
+                                t_seen,
+                            });
+                        }
+                        // otherwise `b` drops here; its empty encoder is ended by Drop.
+                    }
+                    render_frame(gpu.as_ref(), l, &j, t_seen);
+                    break;
+                }
+                match batch.as_mut().unwrap().encode(&l.buf, l.window, &j) {
                     Ok(()) => jobs.push((j.seq, j.kernel, emit, items)),
                     Err(st) => {
                         // A rejected chunk fails the whole job; drop its remaining chunks.
@@ -756,8 +776,10 @@ fn dispatcher(gpu: Arc<Gpu>, cfg: Config, bell: Arc<Arena>, rx: mpsc::Receiver<L
                     chain_wait_ns += fb_core::time::now_ns() - t0;
                 }
             }
-            if !jobs.is_empty() {
-                l.inflight.push_back(Pending { cb: batch.commit(), jobs, t_seen });
+            if let Some(b) = batch {
+                if !jobs.is_empty() {
+                    l.inflight.push_back(Pending { cb: b.commit(), jobs, t_seen });
+                }
             }
             flush_completions(l);
             progress = true;
@@ -811,6 +833,52 @@ fn dispatcher(gpu: Arc<Gpu>, cfg: Config, bell: Arc<Arena>, rx: mpsc::Receiver<L
 fn rx_is_empty(_rx: &mpsc::Receiver<Lane>) -> bool {
     // New lanes always ring the bell after sending, so no lost wakeup here.
     true
+}
+
+/// Validate and submit one hardware-rasterized frame (kernel `DRAW_TRIANGLES`). The
+/// framebuffer and vertex buffer both live in the capsule's arena, so every reference is
+/// bounds-checked against the lane's data window before the GPU touches it.
+fn render_frame(gpu: &Gpu, l: &mut Lane, j: &Job, t_seen: u64) {
+    fn reject(l: &mut Lane, j: &Job, t_seen: u64, st: Status) {
+        l.slot.rejected.fetch_add(1, Ordering::Relaxed);
+        l.backlog.push_back(Completion {
+            seq: j.seq,
+            status: st as u32,
+            kernel: j.kernel,
+            t_seen_ns: t_seen,
+            t_done_ns: fb_core::time::now_ns(),
+            ..Default::default()
+        });
+    }
+    let (w, h, vcount) = (j.params[0] as usize, j.params[1] as usize, j.params[2] as usize);
+    if j.n_args < 2 || w == 0 || h == 0 || w > 16384 || h > 16384 || vcount > (1 << 22) {
+        return reject(l, j, t_seen, Status::BadArgs);
+    }
+    let win = l.window;
+    let (a0, a1) = (j.args[0], j.args[1]);
+    let stride = gpu.fb_stride_bytes(w) as u64;
+    let fb_bytes = h as u64 * stride;
+    let v_bytes = vcount as u64 * fb_gpu::VERTEX_BYTES as u64;
+    let in_win = |off: u64, bytes: u64| -> bool {
+        off.checked_add(bytes).is_some_and(|end| off >= win.off && end <= win.off + win.len)
+    };
+    // The framebuffer offset must satisfy Metal's linear-texture alignment (>= 256, which
+    // the arena bump allocator already guarantees for 256-aligned allocations).
+    if a0.off % 256 != 0 || !in_win(a0.off, fb_bytes) || a1.off % 16 != 0 || !in_win(a1.off, v_bytes) {
+        return reject(l, j, t_seen, Status::OutOfBounds);
+    }
+    let stale = !matches!(&l.rt, Some(rt) if rt.off == a0.off && rt.w == w as u32 && rt.h == h as u32);
+    if stale {
+        match gpu.make_target(&l.buf, a0.off as usize, w, h) {
+            Ok(t) => l.rt = Some(t),
+            Err(_) => return reject(l, j, t_seen, Status::GpuError),
+        }
+    }
+    let target = l.rt.as_ref().unwrap();
+    match gpu.render(&l.queue, target, &l.buf, a1.off as usize, vcount) {
+        Ok(cb) => l.inflight.push_back(Pending { cb, jobs: vec![(j.seq, j.kernel, true, 0)], t_seen }),
+        Err(_) => reject(l, j, t_seen, Status::GpuError),
+    }
 }
 
 fn flush_completions(l: &mut Lane) {
