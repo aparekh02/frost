@@ -113,6 +113,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fb-cuda"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+]
+
+[[package]]
 name = "fb-gpu"
 version = "0.1.0"
 dependencies = [

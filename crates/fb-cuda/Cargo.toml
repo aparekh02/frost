@@ -1,0 +1,16 @@
+[package]
+name = "fb-cuda"
+version.workspace = true
+edition.workspace = true
+description = "A CUDA-compatible runtime for Apple Silicon, backed by Metal."
+
+[lib]
+# cdylib so a drop-in libcuda-style shared library can be produced:
+#   cargo build -p fb-cuda --release   ->   target/release/libfb_cuda.dylib
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+anyhow.workspace = true
+objc2.workspace = true
+objc2-foundation = { workspace = true, features = ["NSString", "NSError"] }
+objc2-metal.workspace = true
